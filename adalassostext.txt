@@ -1,0 +1,665 @@
+ic.glmnet.p = function (x, y, crit=c("bic","aic","aicc","hqc","eric"),alpha = 1,p=10,...)
+{
+  if (is.matrix(x) == FALSE) {
+    x = as.matrix(x)
+  }
+  if (is.vector(y) == FALSE) {
+    y = as.vector(y)
+  }
+  crit=match.arg(crit)
+  n=length(y)
+  model = glmnet(x = x, y = y,alpha = alpha, ...)
+  coef = coef(model)
+  lambda = model$lambda
+  df = model$df
+  
+  if(alpha==0){
+    xs = scale(x)
+    I = diag(ncol(x))
+    xx = t(xs)%*%xs
+    for(i in 1:length(lambda)){
+      aux = solve(xx + I*lambda[i])
+      df[i] = sum(diag(xs%*%aux%*%t(xs)))
+    }
+    
+    
+  }
+  
+  
+  
+  yhat=cbind(1,x)%*%coef
+  residuals = (y- yhat)
+  mse = colMeans(residuals^2)
+  sse = colSums(residuals^2)
+  
+  nvar = df + 1
+  bic = n*log(mse)+nvar*log(n)
+  aic = n*log(mse)+2*nvar
+  aicc = aic+(2*nvar*(nvar+1))/(n-nvar-1)
+  hqc = n*log(mse)+2*nvar*log(log(n))
+  #setting ERIC parameter nu = 0.5 , and phi=sigma^2 estimated by mse
+  eric = n*log(mse)+2*0.5*nvar*log(n*mse/lambda)
+  
+  sst = (n-1)*var(y)
+  r2 = 1 - (sse/sst)
+  adjr2 = (1 - (1 - r2) * (n - 1)/(nrow(x) - nvar - 1))
+  
+  # crit=switch(crit,bic=bic,aic=aic,aicc=aicc,hqc=hqc,eric=eric)
+  # 
+  # selected=best.model = which(crit == min(crit))
+  
+  # select smallest lambda such that number of nonzero coefficients is less than or equal to p
+
+  selected=best.model= max(which(df<= p))
+  
+  ic=c(bic=bic[selected],aic=aic[selected],aicc=aicc[selected],hqc=hqc[selected],eric=eric[selected])
+  
+  result=list(coefficients=coef[,selected],ic=ic,lambda = lambda[selected], nvar=nvar[selected],
+              glmnet=model,residuals=residuals[,selected],fitted.values=yhat[,selected],ic.range=crit, df = df, call = match.call())
+  
+  class(result)="ic.glmnet"
+  return(result)
+}
+
+
+runlasso=function(Y,indice,lag,alpha=1,type="lasso"){
+  comp=princomp(scale(Y,scale=FALSE))
+  Y2=cbind(Y,comp$scores[,1:4])
+  aux=embed(Y2,4+lag)
+  y=aux[,indice]
+  X=aux[,-c(1:(ncol(Y2)*lag))]  
+  
+  
+  
+  if(lag==1){
+    X.out=as.matrix(tail(aux,1)[,1:ncol(X), drop=FALSE])  
+  }else{
+    X.out=aux[,-c(1:(ncol(Y2)*(lag-1)))]
+    X.out=tail(X.out,1)[1:ncol(X)]
+  }
+  
+  X.out=as.matrix(tail(aux,1)[,1:ncol(X), drop=FALSE])  # y = y[1:(length(y)-lag+1)]
+  # X = X[1:(nrow(X)-lag+1),]
+  
+  model=ic.glmnet(X,y,alpha = alpha)
+  coef=model$coef
+  if(type=="adalasso"){
+    penalty=(abs(coef[-1])+1/sqrt(length(y)))^(-1)
+    model=ic.glmnet(X,y,penalty.factor = penalty,alpha=alpha)
+  }
+  
+  if(type=="fal"){
+    taus=c(seq(0.1,1,0.1),1.25,1.5,2,3,4,5,7,10)
+    alphas=seq(0,1,0.1)
+    bb=Inf
+    for(alpha in alphas){
+      m0=ic.glmnet(X,y,alpha = alpha)
+      coef=m0$coef
+      for(tau in taus){
+        penalty=(abs(coef[-1])+1/sqrt(length(y)))^(-tau)
+        m=ic.glmnet(X,y,penalty.factor = penalty)
+        crit=m$bic
+        if(crit<bb){
+          model=m
+          bb=crit
+        }
+      }
+    }
+  }
+  pred=predict(model,X.out)
+  
+  return(list("model"=model,"pred"=pred))
+}
+
+
+lasso.rolling.window=function(Y,nprev,indice=1,lag=1,alpha=1,type="lasso"){
+  
+  save.coef=matrix(NA,nprev,21+ncol(Y[,-1])*4)
+  save.pred=matrix(NA,nprev,1)
+  for(i in nprev:1){
+    window_len <- nrow(Y)-nprev-12; Tplush <- nrow(Y)+1-i ; endwind <- Tplush-lag ;  beginwind <- endwind-window_len ; Y.window=Y[(1+nprev-i):endwind,]
+    lasso=runlasso(Y.window,indice,lag,alpha,type)
+    save.coef[(1+nprev-i),]=lasso$model$coef
+    save.pred[(1+nprev-i),]=lasso$pred
+    cat("iteration",(1+nprev-i),"\n")
+  }
+  
+  real=Y[,indice]
+  
+  #these lines seem pointless, commenting out
+  # plot(real,type="l")
+  # lines(c(rep(NA,length(real)-nprev),save.pred),col="red")
+  
+  rmse=sqrt(mean((tail(real,nprev)-save.pred)^2))
+  mae=mean(abs(tail(real,nprev)-save.pred))
+  
+  #median absolute deviation from the median in paper, but not in code
+  mad = median(abs(tail(real,nprev)-save.pred - median(tail(real,nprev)-save.pred)))
+  
+  #mean absolute deviation from  he mean
+  mean_ad = mean(abs(tail(real,nprev)-save.pred - mean(tail(real,nprev)-save.pred)))
+  
+  
+  #mean relative absolute error (relative to random walk)
+  #last 132 lagged one month values are
+  #real[(nrow(dados)-nprev):(nrow(dados)-1)]
+  mrae = mean(abs( (tail(real,nprev)-save.pred)/
+                     (tail(real,nprev)-real[(nrow(dados)-nprev):(nrow(dados)-1)]  )     ))
+  
+  #mean absolute scaled error
+  #equivalent to mae of method divided by nae of naive forecast
+  #first calculate the denomiator
+  #mean of vector of length nprev-1
+  tempdenom = mean( abs(tail(real,nprev-1) - real[(nrow(dados)-nprev+1):(nrow(dados)-1)]  ) )
+  #then the overall measure is
+  mase=mae/tempdenom
+  
+  #mean absolute percentage error
+  mape = (100/nprev)*mean(abs((tail(real,nprev)-save.pred)/tail(real,nprev)))
+  
+  #normalized rmse
+  nrmse = rmse/(max(tail(real,nprev))-min(tail(real,nprev)))
+  
+  #rmse relative to random walk
+  
+  #rmse of naive rw forecast
+  rwrmse=sqrt(mean((tail(real,nprev)-real[(nrow(dados)-nprev):(nrow(dados)-1)])^2))
+  
+  rmse_rel_rw = rmse/rwrmse
+  
+  
+  errors=c("rmse"=rmse,
+           "mae"=mae,
+           "mad"=mad,
+           "mean_ad"=mean_ad,
+           "mrae"=mrae,
+           "mase"=mase,
+           "mape"=mape,
+           "nrmse"=nrmse,
+           "rmse_rel_rw"=rmse_rel_rw)
+  
+  
+  return(list("pred"=save.pred,"coef"=save.coef,"errors"=errors))
+}
+
+
+## == ##
+runpols=function(Y,indice,lag,coef){
+  
+  comp=princomp(scale(Y,scale=FALSE))
+  Y2=cbind(Y,comp$scores[,1:4])
+  aux=embed(Y2,4+lag)
+  y=aux[,indice]
+  X=aux[,-c(1:(ncol(Y2)*lag))]  
+  
+  if(lag==1){
+    X.out=as.matrix(tail(aux,1)[,1:ncol(X), drop=FALSE])  
+  }else{
+    X.out=aux[,-c(1:(ncol(Y2)*(lag-1)))]
+    X.out=tail(X.out,1)[1:ncol(X)]
+  }
+  
+  respo=X[,which(coef[-1]!=0)]
+  if(length(respo)==0){
+    model=lm(y ~ 1)
+  }else{
+    model=lm(y ~ respo)
+  }
+  
+  pred=c(1,X.out[which( (coef[-1]!=0 )  )])[ which( !(is.na(coef(model)) ))]%*%coef(model)[which( !(is.na(coef(model)) ) )]
+  
+  return(list("model"=model,"pred"=pred))
+}
+
+
+pols.rolling.window=function(Y,nprev,indice=1,lag=1,coef){
+  
+  save.pred=matrix(NA,nprev,1)
+  for(i in nprev:1){
+    window_len <- nrow(Y)-nprev-12; Tplush <- nrow(Y)+1-i ; endwind <- Tplush-lag ;  beginwind <- endwind-window_len ; Y.window=Y[(1+nprev-i):endwind,]
+    m=runpols(Y.window,indice,lag,coef[(1+nprev-i),])
+    save.pred[(1+nprev-i),]=m$pred
+    cat("iteration",(1+nprev-i),"\n")
+  }
+  
+  real=Y[,indice]
+  
+  #these lines seem pointless, commenting out
+  # plot(real,type="l")
+  # lines(c(rep(NA,length(real)-nprev),save.pred),col="red")
+  
+  rmse=sqrt(mean((tail(real,nprev)-save.pred)^2))
+  mae=mean(abs(tail(real,nprev)-save.pred))
+  
+  #median absolute deviation from the median in paper, but not in code
+  mad = median(abs(tail(real,nprev)-save.pred - median(tail(real,nprev)-save.pred)))
+  
+  #mean absolute deviation from  he mean
+  mean_ad = mean(abs(tail(real,nprev)-save.pred - mean(tail(real,nprev)-save.pred)))
+  
+  
+  #mean relative absolute error (relative to random walk)
+  #last 132 lagged one month values are
+  #real[(nrow(dados)-nprev):(nrow(dados)-1)]
+  mrae = mean(abs( (tail(real,nprev)-save.pred)/
+                     (tail(real,nprev)-real[(nrow(dados)-nprev):(nrow(dados)-1)]  )     ))
+  
+  #mean absolute scaled error
+  #equivalent to mae of method divided by nae of naive forecast
+  #first calculate the denomiator
+  #mean of vector of length nprev-1
+  tempdenom = mean( abs(tail(real,nprev-1) - real[(nrow(dados)-nprev+1):(nrow(dados)-1)]  ) )
+  #then the overall measure is
+  mase=mae/tempdenom
+  
+  #mean absolute percentage error
+  mape = (100/nprev)*mean(abs((tail(real,nprev)-save.pred)/tail(real,nprev)))
+  
+  #normalized rmse
+  nrmse = rmse/(max(tail(real,nprev))-min(tail(real,nprev)))
+  
+  #rmse relative to random walk
+  
+  #rmse of naive rw forecast
+  rwrmse=sqrt(mean((tail(real,nprev)-real[(nrow(dados)-nprev):(nrow(dados)-1)])^2))
+  
+  rmse_rel_rw = rmse/rwrmse
+  
+  
+  errors=c("rmse"=rmse,
+           "mae"=mae,
+           "mad"=mad,
+           "mean_ad"=mean_ad,
+           "mrae"=mrae,
+           "mase"=mase,
+           "mape"=mape,
+           "nrmse"=nrmse,
+           "rmse_rel_rw"=rmse_rel_rw)
+  
+  #mean prediction interval coverage
+  # predint_cov = mean( 1*((save.pred_intervals[,1] < tail(real,nprev))  & (tail(real,nprev) < save.pred_intervals[,2])   ))
+  
+  #mean prediction interval width
+  # predint_width = mean(save.pred_intervals[,2] - save.pred_intervals[,1])
+  
+  
+  
+  
+  
+  
+  
+  return(list("pred"= save.pred,
+              "errors"= errors#,"coef"=save.coef#,
+              # "save.pred_intervals"= save.pred_intervals,
+              #"save.geweke_bart_testpreds"= save.geweke_bart_testpreds,
+              #"save.geweke_bart_sigma"= save.geweke_bart_sigma,
+              # "save.importance"= save.importance,
+              # "save.pip"= save.pip,
+              # "predint_cov"= predint_cov,
+              # "predint_width"= predint_width
+  ))
+}
+
+
+runlasso=function(Y,indice,lag,alpha=1,type="lasso"){
+  comp=princomp(scale(Y,scale=FALSE))
+  Y2=cbind(Y,comp$scores[,1:4])
+  aux=embed(Y2,4+lag)
+  y=aux[,indice]
+  X=aux[,-c(1:(ncol(Y2)*lag))]  
+  
+  
+  
+  if(lag==1){
+    X.out=as.matrix(tail(aux,1)[,1:ncol(X), drop=FALSE])  
+  }else{
+    X.out=aux[,-c(1:(ncol(Y2)*(lag-1)))]
+    X.out=tail(X.out,1)[1:ncol(X)]
+  }
+  
+  X.out=as.matrix(tail(aux,1)[,1:ncol(X), drop=FALSE])  # y = y[1:(length(y)-lag+1)]
+  # X = X[1:(nrow(X)-lag+1),]
+  
+  v = 1
+  z = ncol(X)/4
+  comb1 = matrix(NA,nrow(X),(z^2)*4)
+  comb1out = rep(NA,(z^2)*4)
+  for(u in 1:4){
+    comb0 = X[,(u*(ncol(Y2))-(ncol(Y2)-1)):(u*ncol(Y2))]
+    comb0out = X.out[(u*(ncol(Y2))-(ncol(Y2)-1)):(u*ncol(Y2))]
+    for(i in 1:ncol(comb0)){
+      for(j in 1:ncol(comb0)){
+        comb1[,v] = comb0[,i]*comb0[,j]
+        comb1out[v] = comb0out[i]*comb0out[j]
+        v = v+1
+      }
+    }
+  }
+  
+  
+  
+  model=ic.glmnet(comb1,y,alpha = alpha)
+  coef=model$coef
+  if(type=="adalasso"){
+    penalty=(abs(coef[-1])+1/sqrt(length(y)))^(-1)
+    model=ic.glmnet(comb1,y,penalty.factor = penalty,alpha=alpha)
+  }
+  
+  pred=predict(model,comb1out)
+  
+  return(list("model"=model,"pred"=pred))
+}
+
+
+lasso.rolling.window=function(Y,nprev,indice=1,lag=1,alpha=1,type="lasso"){
+  
+  save.coef=matrix(NA,nprev,1+(20+ncol(Y[,-1])*4)*(ncol(Y)+4))
+  save.pred=matrix(NA,nprev,1)
+  for(i in nprev:1){
+    window_len <- nrow(Y)-nprev-12; Tplush <- nrow(Y)+1-i ; endwind <- Tplush-lag ;  beginwind <- endwind-window_len ; Y.window=Y[(1+nprev-i):endwind,]
+    lasso=runlasso(Y.window,indice,lag,alpha,type)
+    save.coef[(1+nprev-i),]=lasso$model$coef
+    save.pred[(1+nprev-i),]=lasso$pred
+    cat("iteration",(1+nprev-i),"\n")
+  }
+  
+  real=Y[,indice]
+  
+  #these lines seem pointless, commenting out
+  # plot(real,type="l")
+  # lines(c(rep(NA,length(real)-nprev),save.pred),col="red")
+  
+  rmse=sqrt(mean((tail(real,nprev)-save.pred)^2))
+  mae=mean(abs(tail(real,nprev)-save.pred))
+  
+  #median absolute deviation from the median in paper, but not in code
+  mad = median(abs(tail(real,nprev)-save.pred - median(tail(real,nprev)-save.pred)))
+  
+  #mean absolute deviation from  he mean
+  mean_ad = mean(abs(tail(real,nprev)-save.pred - mean(tail(real,nprev)-save.pred)))
+  
+  
+  #mean relative absolute error (relative to random walk)
+  #last 132 lagged one month values are
+  #real[(nrow(dados)-nprev):(nrow(dados)-1)]
+  mrae = mean(abs( (tail(real,nprev)-save.pred)/
+                     (tail(real,nprev)-real[(nrow(dados)-nprev):(nrow(dados)-1)]  )     ))
+  
+  #mean absolute scaled error
+  #equivalent to mae of method divided by nae of naive forecast
+  #first calculate the denomiator
+  #mean of vector of length nprev-1
+  tempdenom = mean( abs(tail(real,nprev-1) - real[(nrow(dados)-nprev+1):(nrow(dados)-1)]  ) )
+  #then the overall measure is
+  mase=mae/tempdenom
+  
+  #mean absolute percentage error
+  mape = (100/nprev)*mean(abs((tail(real,nprev)-save.pred)/tail(real,nprev)))
+  
+  #normalized rmse
+  nrmse = rmse/(max(tail(real,nprev))-min(tail(real,nprev)))
+  
+  #rmse relative to random walk
+  
+  #rmse of naive rw forecast
+  rwrmse=sqrt(mean((tail(real,nprev)-real[(nrow(dados)-nprev):(nrow(dados)-1)])^2))
+  
+  rmse_rel_rw = rmse/rwrmse
+  
+  
+  errors=c("rmse"=rmse,
+           "mae"=mae,
+           "mad"=mad,
+           "mean_ad"=mean_ad,
+           "mrae"=mrae,
+           "mase"=mase,
+           "mape"=mape,
+           "nrmse"=nrmse,
+           "rmse_rel_rw"=rmse_rel_rw)
+  
+  #mean prediction interval coverage
+  # predint_cov = mean( 1*((save.pred_intervals[,1] < tail(real,nprev))  & (tail(real,nprev) < save.pred_intervals[,2])   ))
+  
+  #mean prediction interval width
+  # predint_width = mean(save.pred_intervals[,2] - save.pred_intervals[,1])
+  
+  
+  
+  
+  
+  
+  
+  return(list("pred"= save.pred,
+              "errors"= errors,"coef"=save.coef#,
+              # "save.pred_intervals"= save.pred_intervals,
+              #"save.geweke_bart_testpreds"= save.geweke_bart_testpreds,
+              #"save.geweke_bart_sigma"= save.geweke_bart_sigma,
+              # "save.importance"= save.importance,
+              # "save.pip"= save.pip,
+              # "predint_cov"= predint_cov,
+              # "predint_width"= predint_width
+  ))
+}
+
+source("UK/first-sample/functions/rep_Eoghan_newPCAoldstart/func-lasso.R")
+library(HDeconometrics)
+load("UK/first-sample/rawdata.rda")
+Y=dados
+
+nprev=132
+alpha=1
+
+## == passado == ##
+
+adalasso1c=lasso.rolling.window(Y,nprev,1,1,alpha,type="adalasso")
+adalasso1p=lasso.rolling.window(Y,nprev,2,1,alpha,type="adalasso")
+adalasso2c=lasso.rolling.window(Y,nprev,1,2,alpha,type="adalasso")
+adalasso2p=lasso.rolling.window(Y,nprev,2,2,alpha,type="adalasso")
+adalasso3c=lasso.rolling.window(Y,nprev,1,3,alpha,type="adalasso")
+adalasso3p=lasso.rolling.window(Y,nprev,2,3,alpha,type="adalasso")
+adalasso4c=lasso.rolling.window(Y,nprev,1,4,alpha,type="adalasso")
+adalasso4p=lasso.rolling.window(Y,nprev,2,4,alpha,type="adalasso")
+adalasso5c=lasso.rolling.window(Y,nprev,1,5,alpha,type="adalasso")
+adalasso5p=lasso.rolling.window(Y,nprev,2,5,alpha,type="adalasso")
+adalasso6c=lasso.rolling.window(Y,nprev,1,6,alpha,type="adalasso")
+adalasso6p=lasso.rolling.window(Y,nprev,2,6,alpha,type="adalasso")
+adalasso7c=lasso.rolling.window(Y,nprev,1,7,alpha,type="adalasso")
+adalasso7p=lasso.rolling.window(Y,nprev,2,7,alpha,type="adalasso")
+adalasso8c=lasso.rolling.window(Y,nprev,1,8,alpha,type="adalasso")
+adalasso8p=lasso.rolling.window(Y,nprev,2,8,alpha,type="adalasso")
+adalasso9c=lasso.rolling.window(Y,nprev,1,9,alpha,type="adalasso")
+adalasso9p=lasso.rolling.window(Y,nprev,2,9,alpha,type="adalasso")
+adalasso10c=lasso.rolling.window(Y,nprev,1,10,alpha,type="adalasso")
+adalasso10p=lasso.rolling.window(Y,nprev,2,10,alpha,type="adalasso")
+adalasso11c=lasso.rolling.window(Y,nprev,1,11,alpha,type="adalasso")
+adalasso11p=lasso.rolling.window(Y,nprev,2,11,alpha,type="adalasso")
+adalasso12c=lasso.rolling.window(Y,nprev,1,12,alpha,type="adalasso")
+adalasso12p=lasso.rolling.window(Y,nprev,2,12,alpha,type="adalasso")
+
+# pols #
+pols.adalasso1c=pols.rolling.window(Y,nprev,1,1,adalasso1c$coef)
+pols.adalasso1p=pols.rolling.window(Y,nprev,2,1,adalasso1p$coef)
+pols.adalasso2c=pols.rolling.window(Y,nprev,1,2,adalasso2c$coef)
+pols.adalasso2p=pols.rolling.window(Y,nprev,2,2,adalasso2p$coef)
+pols.adalasso3c=pols.rolling.window(Y,nprev,1,3,adalasso3c$coef)
+pols.adalasso3p=pols.rolling.window(Y,nprev,2,3,adalasso3p$coef)
+pols.adalasso4c=pols.rolling.window(Y,nprev,1,4,adalasso4c$coef)
+pols.adalasso4p=pols.rolling.window(Y,nprev,2,4,adalasso4p$coef)
+pols.adalasso5c=pols.rolling.window(Y,nprev,1,5,adalasso5c$coef)
+pols.adalasso5p=pols.rolling.window(Y,nprev,2,5,adalasso5p$coef)
+pols.adalasso6c=pols.rolling.window(Y,nprev,1,6,adalasso6c$coef)
+pols.adalasso6p=pols.rolling.window(Y,nprev,2,6,adalasso6p$coef)
+pols.adalasso7c=pols.rolling.window(Y,nprev,1,7,adalasso7c$coef)
+pols.adalasso7p=pols.rolling.window(Y,nprev,2,7,adalasso7p$coef)
+pols.adalasso8c=pols.rolling.window(Y,nprev,1,8,adalasso8c$coef)
+pols.adalasso8p=pols.rolling.window(Y,nprev,2,8,adalasso8p$coef)
+pols.adalasso9c=pols.rolling.window(Y,nprev,1,9,adalasso9c$coef)
+pols.adalasso9p=pols.rolling.window(Y,nprev,2,9,adalasso9p$coef)
+pols.adalasso10c=pols.rolling.window(Y,nprev,1,10,adalasso10c$coef)
+pols.adalasso10p=pols.rolling.window(Y,nprev,2,10,adalasso10p$coef)
+pols.adalasso11c=pols.rolling.window(Y,nprev,1,11,adalasso11c$coef)
+pols.adalasso11p=pols.rolling.window(Y,nprev,2,11,adalasso11p$coef)
+pols.adalasso12c=pols.rolling.window(Y,nprev,1,12,adalasso12c$coef)
+pols.adalasso12p=pols.rolling.window(Y,nprev,2,12,adalasso12p$coef)
+
+
+### == juntando tudo ==  ###
+
+
+### == juntando tudo ==  ###
+
+cpi=cbind(adalasso1c$pred,adalasso2c$pred,adalasso3c$pred,adalasso4c$pred,
+          adalasso5c$pred,adalasso6c$pred,adalasso7c$pred,adalasso8c$pred,
+          adalasso9c$pred,adalasso10c$pred,adalasso11c$pred,adalasso12c$pred)
+
+pce=cbind(adalasso1p$pred,adalasso2p$pred,adalasso3p$pred,adalasso4p$pred,
+          adalasso5p$pred,adalasso6p$pred,adalasso7p$pred,adalasso8p$pred,
+          adalasso9p$pred,adalasso10p$pred,adalasso11p$pred,adalasso12p$pred)
+
+
+##
+write.table(cpi,"UK/forecasts/rep_passado2000_fixed_oldstart/adalasso-cpi.csv",sep=";",row.names = FALSE, col.names = FALSE)
+write.table(pce,"UK/forecasts/rep_passado2000_fixed_oldstart/adalasso--pce.csv",sep=";",row.names = FALSE, col.names = FALSE)
+
+#save all the results, including intervals etc
+save(adalasso1c,adalasso2c,adalasso3c,adalasso4c,
+     adalasso5c,adalasso6c,adalasso7c,adalasso8c,
+     adalasso9c,adalasso10c,adalasso11c,adalasso12c ,
+     file = "UK/forecasts/rep_passado2000_fixed_oldstart/adalasso-all-cpi.Rdata")
+
+
+adalasso_cpi_list <- list(adalasso1c,adalasso2c,adalasso3c,adalasso4c,
+                               adalasso5c,adalasso6c,adalasso7c,adalasso8c,
+                               adalasso9c,adalasso10c,adalasso11c,adalasso12c)
+
+save(adalasso_cpi_list ,file =  "UK/forecasts/rep_passado2000_fixed_oldstart/adalasso-list-cpi.Rdata")
+
+
+adalasso_pce_list <- list(adalasso1p,adalasso2p,adalasso3p,adalasso4p,
+                               adalasso5p,adalasso6p,adalasso7p,adalasso8p,
+                               adalasso9p,adalasso10p,adalasso11p,adalasso12p)
+
+save(adalasso_pce_list , file = "UK/forecasts/rep_passado2000_fixed_oldstart/adalasso-list-pce.Rdata")
+
+
+
+
+
+
+
+
+
+
+
+
+### == juntando tudo ==  ###
+
+cpi=cbind(pols.adalasso1c$pred,pols.adalasso2c$pred,pols.adalasso3c$pred,pols.adalasso4c$pred,
+          pols.adalasso5c$pred,pols.adalasso6c$pred,pols.adalasso7c$pred,pols.adalasso8c$pred,
+          pols.adalasso9c$pred,pols.adalasso10c$pred,pols.adalasso11c$pred,pols.adalasso12c$pred)
+
+pce=cbind(pols.adalasso1p$pred,pols.adalasso2p$pred,pols.adalasso3p$pred,pols.adalasso4p$pred,
+          pols.adalasso5p$pred,pols.adalasso6p$pred,pols.adalasso7p$pred,pols.adalasso8p$pred,
+          pols.adalasso9p$pred,pols.adalasso10p$pred,pols.adalasso11p$pred,pols.adalasso12p$pred)
+
+
+##
+write.table(cpi,"UK/forecasts/rep_passado2000_fixed_oldstart/pols.adalasso-cpi.csv",sep=";",row.names = FALSE, col.names = FALSE)
+write.table(pce,"UK/forecasts/rep_passado2000_fixed_oldstart/pols.adalasso--pce.csv",sep=";",row.names = FALSE, col.names = FALSE)
+
+#save all the results, including intervals etc
+save(pols.adalasso1c,pols.adalasso2c,pols.adalasso3c,pols.adalasso4c,
+     pols.adalasso5c,pols.adalasso6c,pols.adalasso7c,pols.adalasso8c,
+     pols.adalasso9c,pols.adalasso10c,pols.adalasso11c,pols.adalasso12c ,
+     file = "UK/forecasts/rep_passado2000_fixed_oldstart/pols.adalasso-all-cpi.Rdata")
+
+
+pols.adalasso_cpi_list <- list(pols.adalasso1c,pols.adalasso2c,pols.adalasso3c,pols.adalasso4c,
+                               pols.adalasso5c,pols.adalasso6c,pols.adalasso7c,pols.adalasso8c,
+                               pols.adalasso9c,pols.adalasso10c,pols.adalasso11c,pols.adalasso12c)
+
+save(pols.adalasso_cpi_list ,file =  "UK/forecasts/rep_passado2000_fixed_oldstart/pols.adalasso-list-cpi.Rdata")
+
+
+pols.adalasso_pce_list <- list(pols.adalasso1p,pols.adalasso2p,pols.adalasso3p,pols.adalasso4p,
+                               pols.adalasso5p,pols.adalasso6p,pols.adalasso7p,pols.adalasso8p,
+                               pols.adalasso9p,pols.adalasso10p,pols.adalasso11p,pols.adalasso12p)
+
+save(pols.adalasso_pce_list , file = "UK/forecasts/rep_passado2000_fixed_oldstart/pols.adalasso-list-pce.Rdata")
+
+
+source("UK/first-sample/functions/rep_Eoghan_newPCAoldstart/func-polilasso.R")
+library(HDeconometrics)
+load("UK/first-sample/rawdata.rda")
+Y=dados
+
+nprev=132
+alpha=1
+
+## == passado == ##
+
+adalasso_1c=lasso.rolling.window(Y,nprev,1,1,alpha,type="adalasso")
+adalasso_1p=lasso.rolling.window(Y,nprev,2,1,alpha,type="adalasso")
+adalasso_2c=lasso.rolling.window(Y,nprev,1,2,alpha,type="adalasso")
+adalasso_2p=lasso.rolling.window(Y,nprev,2,2,alpha,type="adalasso")
+adalasso_3c=lasso.rolling.window(Y,nprev,1,3,alpha,type="adalasso")
+adalasso_3p=lasso.rolling.window(Y,nprev,2,3,alpha,type="adalasso")
+adalasso_4c=lasso.rolling.window(Y,nprev,1,4,alpha,type="adalasso")
+adalasso_4p=lasso.rolling.window(Y,nprev,2,4,alpha,type="adalasso")
+adalasso_5c=lasso.rolling.window(Y,nprev,1,5,alpha,type="adalasso")
+adalasso_5p=lasso.rolling.window(Y,nprev,2,5,alpha,type="adalasso")
+adalasso_6c=lasso.rolling.window(Y,nprev,1,6,alpha,type="adalasso")
+adalasso_6p=lasso.rolling.window(Y,nprev,2,6,alpha,type="adalasso")
+adalasso_7c=lasso.rolling.window(Y,nprev,1,7,alpha,type="adalasso")
+adalasso_7p=lasso.rolling.window(Y,nprev,2,7,alpha,type="adalasso")
+adalasso_8c=lasso.rolling.window(Y,nprev,1,8,alpha,type="adalasso")
+adalasso_8p=lasso.rolling.window(Y,nprev,2,8,alpha,type="adalasso")
+adalasso_9c=lasso.rolling.window(Y,nprev,1,9,alpha,type="adalasso")
+adalasso_9p=lasso.rolling.window(Y,nprev,2,9,alpha,type="adalasso")
+adalasso_10c=lasso.rolling.window(Y,nprev,1,10,alpha,type="adalasso")
+adalasso_10p=lasso.rolling.window(Y,nprev,2,10,alpha,type="adalasso")
+adalasso_11c=lasso.rolling.window(Y,nprev,1,11,alpha,type="adalasso")
+adalasso_11p=lasso.rolling.window(Y,nprev,2,11,alpha,type="adalasso")
+adalasso_12c=lasso.rolling.window(Y,nprev,1,12,alpha,type="adalasso")
+adalasso_12p=lasso.rolling.window(Y,nprev,2,12,alpha,type="adalasso")
+
+
+### == juntando tudo ==  ###
+
+
+cpi=cbind(adalasso_1c$pred,adalasso_2c$pred,adalasso_3c$pred,adalasso_4c$pred,
+          adalasso_5c$pred,adalasso_6c$pred,adalasso_7c$pred,adalasso_8c$pred,
+          adalasso_9c$pred,adalasso_10c$pred,adalasso_11c$pred,adalasso_12c$pred)
+
+pce=cbind(adalasso_1p$pred,adalasso_2p$pred,adalasso_3p$pred,adalasso_4p$pred,
+          adalasso_5p$pred,adalasso_6p$pred,adalasso_7p$pred,adalasso_8p$pred,
+          adalasso_9p$pred,adalasso_10p$pred,adalasso_11p$pred,adalasso_12p$pred)
+
+
+##
+write.table(cpi,"UK/forecasts/rep_passado2000_fixed_oldstart/adalassopoli-cpi.csv",sep=";",row.names = FALSE, col.names = FALSE)
+write.table(pce,"UK/forecasts/rep_passado2000_fixed_oldstart/adalassopoli--pce.csv",sep=";",row.names = FALSE, col.names = FALSE)
+
+#save all the results, including intervals etc
+save(adalasso_1c,adalasso_2c,adalasso_3c,adalasso_4c,
+     adalasso_5c,adalasso_6c,adalasso_7c,adalasso_8c,
+     adalasso_9c,adalasso_10c,adalasso_11c,adalasso_12c ,
+     file = "UK/forecasts/rep_passado2000_fixed_oldstart/adalassopoli-all-cpi.Rdata")
+
+
+adalasso_cpi_list <- list(adalasso_1c,adalasso_2c,adalasso_3c,adalasso_4c,
+                       adalasso_5c,adalasso_6c,adalasso_7c,adalasso_8c,
+                       adalasso_9c,adalasso_10c,adalasso_11c,adalasso_12c)
+
+save(adalasso_cpi_list ,file =  "UK/forecasts/rep_passado2000_fixed_oldstart/adalassopoli-list-cpi.Rdata")
+
+
+adalasso_pce_list <- list(adalasso_1p,adalasso_2p,adalasso_3p,adalasso_4p,
+                       adalasso_5p,adalasso_6p,adalasso_7p,adalasso_8p,
+                       adalasso_9p,adalasso_10p,adalasso_11p,adalasso_12p)
+
+save(adalasso_pce_list , file = "UK/forecasts/rep_passado2000_fixed_oldstart/adalassopoli-list-pce.Rdata")
+
+
+
+

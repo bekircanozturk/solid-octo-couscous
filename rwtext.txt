@@ -1,0 +1,95 @@
+## --- Random Walk rolling evaluation (no PIs, no MASE/MAPE) ------------------
+
+suppressPackageStartupMessages(library(forecast))
+
+# h-step RW (no drift) point forecast from a training window y
+runRW <- function(y, h){
+  rw <- rwf(y, h = h, drift = FALSE, fan = FALSE, lambda = NULL, biasadj = FALSE)
+  as.numeric(rw$mean[h])  # h-step point forecast = last(y) under RW
+}
+
+# Rolling evaluation for a given series y, OOS length nprev, horizon lag
+# CHANGED: returns an nprev-length vector with NO NA padding (matches Code 2 alignment)
+rw.rolling.window <- function(y, nprev, lag = 1, do_plot = FALSE){
+  y <- as.numeric(y)
+  N <- length(y)
+  if (nprev <= 0L || lag <= 0L) stop("nprev and lag must be positive integers.")
+  if (nprev > N - lag) stop("For horizon h=", lag, " you need nprev <= N - h.")
+  
+  # indices of training end for each of the nprev origins (no padding)
+  end_idx <- (N - nprev - lag + 1L):(N - lag)  # length nprev
+  
+  # predictions: for RW this equals y[end_idx], but we keep runRW for symmetry
+  pred <- vapply(end_idx, function(ei) runRW(y[1:ei], h = lag), numeric(1))
+  
+  # corresponding OOS realizations (targets) are y[end_idx + lag] = last nprev values
+  real_oos <- y[end_idx + lag]  # length nprev
+  
+  # errors
+  err <- real_oos - pred
+  ae  <- abs(err)
+  se  <- err^2
+  
+  # Metrics on full (unpadded) OOS
+  rmse <- sqrt(mean(se))
+  mae  <- mean(ae)
+  mad  <- median(abs(err - median(err)))
+  mean_ad <- mean(abs(err - mean(err)))
+  nrmse <- rmse / (max(real_oos) - min(real_oos))
+  
+  # Relative-to-RW baseline for SAME horizon (here identical to our model under RW)
+  base_err <- real_oos - y[end_idx]  # = err for RW
+  base_rmse <- sqrt(mean(base_err^2))
+  denom_mrae <- pmax(abs(base_err), .Machine$double.eps)
+  mrae <- mean(ae / denom_mrae)
+  rmse_rel_rw <- rmse / base_rmse
+  
+  if (do_plot) {
+    plot(y, type = "l", main = paste0("RW h=", lag, " rolling forecasts (no padding)"),
+         xlab = "t", ylab = "y")
+    lines(c(rep(NA_real_, N - nprev), pred), col = "red")  # align to last nprev dates
+  }
+  
+  list(
+    pred = matrix(pred, nrow = nprev, ncol = 1, dimnames = list(NULL, "pred")), # NO padding
+    errors = c(rmse = rmse, mae = mae, mad = mad, mean_ad = mean_ad,
+               nrmse = nrmse, mrae = mrae, rmse_rel_rw = rmse_rel_rw),
+    rwlossSQ = se,
+    rwlossABS = ae
+  )
+}
+
+## --- Driver script (CPI only) ----------------------------------------------
+
+# Load your cleaned matrix with date rownames
+load("dados.rda")   # provides `dados` (matrix with date rownames)
+
+# pick CPI by name
+if (!("cpi_total" %in% colnames(dados))) {
+  stop("Column 'cpi_total' not found in `dados`. Available columns:\n",
+       paste(colnames(dados), collapse = ", "))
+}
+y <- dados[, "cpi_total"]
+
+# Choose OOS length
+nprev <- 99   # or 132, as you prefer
+
+# Run RW for horizons 1..12 (each column has length nprev, NO NA padding)
+RW_cpi_list <- lapply(1:12, function(h) rw.rolling.window(y, nprev, lag = h))
+names(RW_cpi_list) <- paste0("RW_h", 1:12)
+
+# Stack point forecasts into an nprev x 12 matrix
+cpi_rw <- do.call(cbind, lapply(RW_cpi_list, function(x) x$pred))
+colnames(cpi_rw) <- paste0("h", 1:12)
+
+# Optional: label rows by the TARGET dates (last nprev dates)
+rownames(cpi_rw) <- tail(rownames(dados), nprev)
+
+# Save
+dir.create("forecasts/rw", recursive = TRUE, showWarnings = FALSE)
+write.table(cpi_rw, "forecasts/rw/RW_cpi_total.csv",
+            sep = ";", row.names = TRUE, col.names = TRUE)
+save(RW_cpi_list, file = "forecasts/rw/RW-list-cpi_total.Rdata")
+
+cat("cpi_total RW forecasts saved (no padding). Matrix dims:",
+    dim(cpi_rw)[1], "x", dim(cpi_rw)[2], "\n")
