@@ -80,7 +80,12 @@ build_xy_paper <- function(dados, yname, h, p_y=4, x_lags=4, pc_fit) {
   colnames(PC) <- paste0("PC", 1:4)
   
   maxdrop <- max(p_y, x_lags)
-  anchors <- maxdrop:(nrow(dados) - h)  # indices of t (issue-time anchors)
+  last_anchor <- nrow(dados) - h
+  if (last_anchor < maxdrop) {
+    stop("Not enough history for horizon h=", h,
+         " (need anchor >= ", maxdrop, ", have last_anchor = ", last_anchor, ").")
+  }
+  anchors <- seq.int(maxdrop, last_anchor)  # indices of t (issue-time anchors)
   X <- cbind(ylag, Xlags, PC)[anchors, , drop = FALSE]
   rownames(X) <- dates[anchors]
   
