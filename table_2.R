@@ -804,12 +804,24 @@ make_table1 <- function(){
     mat_acc <- sapply(models, function(m) ACC_RATIOS[[m]][[which]]) |> t()
     colnames(mat_acc) <- paste0("acc",acc_horizons)
     M <- cbind(mat_h, mat_acc)
+    # Count how many horizons each model attains the column minimum (ignoring all-NA columns)
+    best_count <- vapply(seq_len(ncol(M)), function(j){
+      col <- M[, j]
+      finite <- is.finite(col)
+      if (!any(finite)) return(rep(0L, nrow(M)))
+      min_val <- min(col[finite])
+      as.integer(finite & (abs(col - min_val) < 1e-12))
+    }, integer(nrow(M)))
+    if (!is.matrix(best_count)) {
+      best_count <- matrix(best_count, nrow = nrow(M))
+    }
+    best_count <- rowSums(best_count, na.rm = TRUE)
     tibble(
       model = rownames(M),
       avg = rowMeans(M, na.rm = TRUE),
       max = apply(M, 1, max, na.rm = TRUE),
       min = apply(M, 1, min, na.rm = TRUE),
-      best_count = rowSums(t(apply(M, 2, function(col) col == min(col, na.rm = TRUE))), na.rm = TRUE)
+      best_count = best_count
     )
   }
   S_rmse <- stack_stats("rmse")
