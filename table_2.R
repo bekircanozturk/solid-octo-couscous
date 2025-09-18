@@ -274,7 +274,9 @@ extract_reference_actual <- function(){
   NULL
 }
 
-load_actual_from_dados <- function(series, nprev, ref_cols){
+load_actual_from_dados <- function(series, nprev, ref_cols,
+                                    start_date = "1999-03-01",
+                                    end_date = "2023-12-01"){
   if (is.null(ref_cols)) return(NULL)
   candidate_paths <- c("dados.rda","dados.RData","dados.Rdata","dados.rds","dados.RDS")
   for (path in candidate_paths) {
@@ -289,24 +291,62 @@ load_actual_from_dados <- function(series, nprev, ref_cols){
       if (!(series %in% colnames(obj))) next
       vec <- as.numeric(obj[, series])
       if (!length(vec)) next
-      if (length(vec) < nprev) next
-      actual_vec <- tail(vec, nprev)
+
+      row_ids <- rownames(obj)
+      used_idx <- seq_along(vec)
+      used_dates <- NULL
+      if (!is.null(row_ids)) {
+        date_vals <- suppressWarnings(as.Date(row_ids))
+        if (all(is.na(date_vals))) {
+          sel <- which(row_ids >= start_date & row_ids <= end_date)
+        } else {
+          start_dt <- try(as.Date(start_date), silent = TRUE)
+          end_dt   <- try(as.Date(end_date),   silent = TRUE)
+          if (inherits(start_dt, "try-error")) start_dt <- as.Date(start_date)
+          if (inherits(end_dt, "try-error"))   end_dt   <- as.Date(end_date)
+          sel <- which(!is.na(date_vals) & date_vals >= start_dt & date_vals <= end_dt)
+        }
+        if (length(sel)) {
+          used_idx <- sel
+          used_dates <- row_ids[sel]
+        }
+      }
+
+      if (length(used_idx) < nprev && length(vec) >= nprev) {
+        used_idx <- tail(seq_along(vec), nprev)
+        if (!is.null(row_ids)) used_dates <- row_ids[used_idx]
+      }
+      if (length(used_idx) < nprev) next
+
+      used_idx <- tail(used_idx, nprev)
+      actual_vec <- vec[used_idx]
+
       mat <- matrix(NA_real_, nrow = nprev, ncol = length(ref_cols),
                     dimnames = list(NULL, ref_cols))
+      if (!is.null(used_dates) && length(used_dates) >= nprev) {
+        rownames(mat) <- tail(used_dates, nprev)
+      }
+
       month_cols <- intersect(paste0("h", seq_len(12)), ref_cols)
       for (col in month_cols) mat[, col] <- actual_vec
+
       acc_cols <- intersect(paste0("acc", acc_horizons), ref_cols)
       if (length(acc_cols)) {
         for (col in acc_cols) {
           k <- as.integer(sub("acc", "", col))
-          if (!is.na(k) && k > 0 && length(vec) >= (nprev + k - 1)) {
+          if (!is.na(k) && k > 0 && length(vec) >= k) {
             acc_vals <- zoo::rollapply(vec, width = k, align = "right",
                                       FUN = function(x) mean(x, na.rm = TRUE), fill = NA)
-            mat[, col] <- tail(acc_vals, nprev)
+            mat[, col] <- acc_vals[used_idx]
           }
         }
       }
-      return(list(actual = mat, source = nm, path = path))
+      date_range <- NULL
+      if (!is.null(rownames(mat))) {
+        rn <- rownames(mat)
+        date_range <- c(head(rn, 1), tail(rn, 1))
+      }
+      return(list(actual = mat, source = nm, path = path, range = date_range))
     }
   }
   NULL
@@ -314,27 +354,52 @@ load_actual_from_dados <- function(series, nprev, ref_cols){
 
 ref_info <- extract_reference_actual()
 
+actual_reference <- NULL
+actual_reference_source <- NULL
+actual_reference_path <- NULL
+actual_reference_range <- NULL
+
 if (!is.null(ref_info)) {
-  actual_ref <- ref_info$actual
-  if (!is.null(actual_ref) && !is.matrix(actual_ref)) actual_ref <- as.matrix(actual_ref)
-  if (is.null(colnames(actual_ref))) {
-    ref_cols <- colnames(LOSS_S[[ref_info$source]])
-    if (!is.null(ref_cols)) colnames(actual_ref) <- ref_cols
+  actual_reference <- ref_info$actual
+  actual_reference_source <- ref_info$source
+}
+
+if (is.null(actual_reference)) {
+  dados_info <- load_actual_from_dados(series, nprev, colnames(LOSS_S[[rw_model]]))
+  if (!is.null(dados_info)) {
+    actual_reference <- dados_info$actual
+    actual_reference_source <- dados_info$source
+    actual_reference_path <- dados_info$path
+    actual_reference_range <- dados_info$range
   }
-  ref_cols <- colnames(actual_ref)
-  if (is.null(ref_cols)) ref_cols <- colnames(LOSS_S[[rw_model]])
-  if (!is.null(actual_ref) && nrow(actual_ref) < nprev) {
-    actual_ref <- rbind(actual_ref, matrix(NA_real_, nprev - nrow(actual_ref), ncol(actual_ref)))
+}
+
+if (!is.null(actual_reference)) {
+  if (!is.matrix(actual_reference)) actual_reference <- as.matrix(actual_reference)
+  ref_cols <- colnames(actual_reference)
+  if (is.null(ref_cols) || !length(ref_cols)) {
+    fallback_cols <- colnames(LOSS_S[[rw_model]])
+    if (!is.null(fallback_cols)) {
+      colnames(actual_reference) <- fallback_cols
+      ref_cols <- fallback_cols
+    }
   }
-  if (!is.null(actual_ref) && nrow(actual_ref) > nprev) {
-    actual_ref <- actual_ref[seq_len(nprev), , drop = FALSE]
+  if (is.null(ref_cols)) ref_cols <- paste0("h", seq_len(ncol(actual_reference)))
+
+  if (!is.null(actual_reference) && nrow(actual_reference) < nprev) {
+    actual_reference <- rbind(actual_reference,
+                              matrix(NA_real_, nprev - nrow(actual_reference), ncol(actual_reference)))
   }
+  if (!is.null(actual_reference) && nrow(actual_reference) > nprev) {
+    actual_reference <- actual_reference[seq_len(nprev), , drop = FALSE]
+  }
+
   base_models <- models
   for (nm in base_models) {
     PRED[[nm]] <- normalize_pred_matrix(PRED[[nm]], ref_cols)
   }
 
-  ensembles <- compute_ensembles(actual_ref, ref_cols, base_models, PRED, nprev)
+  ensembles <- compute_ensembles(actual_reference, ref_cols, base_models, PRED, nprev)
 
   added_ensembles <- character(0)
   for (nm in names(ensembles)) {
@@ -350,40 +415,28 @@ if (!is.null(ref_info)) {
 
   if (length(added_ensembles)) {
     models <- c(models, added_ensembles)
-    message("Added ensemble forecasts: ", paste(added_ensembles, collapse = ", "))
+    if (!is.null(actual_reference_path)) {
+      range_txt <- if (!is.null(actual_reference_range) && length(actual_reference_range) == 2)
+        paste0(" [", actual_reference_range[1], " to ", actual_reference_range[2], "]") else ""
+      message("Actuals sourced from ", actual_reference_path, " (object '", actual_reference_source,
+              "')", range_txt, "; added ensembles: ", paste(added_ensembles, collapse = ", "))
+    } else {
+      message("Added ensemble forecasts: ", paste(added_ensembles, collapse = ", "))
+    }
+  } else if (!is.null(actual_reference_path)) {
+    range_txt <- if (!is.null(actual_reference_range) && length(actual_reference_range) == 2)
+      paste0(" [", actual_reference_range[1], " to ", actual_reference_range[2], "]") else ""
+    warning("Actual series loaded from ", actual_reference_path, " (object '", actual_reference_source,
+            "')", range_txt, " but ensembles could not be formed (missing predictions).")
   }
 } else {
-  dados_info <- load_actual_from_dados(series, nprev, colnames(LOSS_S[[rw_model]]))
-  if (!is.null(dados_info)) {
-    actual_ref <- dados_info$actual
-    ref_cols <- colnames(actual_ref)
-    base_models <- models
-    for (nm in base_models) {
-      PRED[[nm]] <- normalize_pred_matrix(PRED[[nm]], ref_cols)
-    }
-    ensembles <- compute_ensembles(actual_ref, ref_cols, base_models, PRED, nprev)
-    added_ensembles <- character(0)
-    for (nm in names(ensembles)) {
-      ens <- ensembles[[nm]]
-      if (is.null(ens)) next
-      if (all(is.na(ens$loss_sq)) && all(is.na(ens$loss_abs))) next
-      if (nm %in% models) next
-      LOSS_S[[nm]] <- ens$loss_sq
-      LOSS_A[[nm]] <- ens$loss_abs
-      PRED[[nm]]   <- ens$pred
-      added_ensembles <- c(added_ensembles, nm)
-    }
-    if (length(added_ensembles)) {
-      models <- c(models, added_ensembles)
-      message("Actuals sourced from ", dados_info$path, " (object '", dados_info$source,
-              "'); added ensembles: ", paste(added_ensembles, collapse = ", "))
-    } else {
-      warning("Actual series loaded from ", dados_info$path, " but ensembles could not be formed (missing predictions).")
-    }
-  } else {
-    warning("No actual series found among models or dados.* files; ensemble rows will be skipped.")
-  }
+  warning("No actual series found among models or dados.* files; ensemble rows will be skipped.")
 }
+
+ACTUAL_REFERENCE <- actual_reference
+ACTUAL_REFERENCE_SOURCE <- actual_reference_source
+ACTUAL_REFERENCE_PATH <- actual_reference_path
+ACTUAL_REFERENCE_RANGE <- actual_reference_range
 
 models <- unique(models)
 
@@ -395,21 +448,57 @@ model_labels <- setNames(ifelse(models %in% ensemble_models,
 
 # -------------------------- METRICS & RATIOS (for Tables 1,2,5) ------------------
 take_monthly <- function(M) {
+  if (is.null(M)) return(NULL)
   keep <- intersect(horizons_monthly, colnames(M))
+  if (!length(keep)) return(NULL)
   M[, keep, drop = FALSE]
 }
-rmse_from_sq  <- function(LS) apply(LS, 2, function(col) sqrt(mean(col, na.rm = TRUE)))
-mae_from_abs  <- function(LA) apply(LA, 2, function(col) mean(col, na.rm = TRUE))
-mad_from_abs  <- function(LA){ apply(LA, 2, function(col) median(col, na.rm = TRUE)) }
 
 metrics_by_model <- function(m){
+  monthly_cols <- horizons_monthly
+  rmse_vals <- setNames(rep(NA_real_, length(monthly_cols)), monthly_cols)
+  mae_vals  <- rmse_vals
+  mad_vals  <- rmse_vals
+
   LSm <- take_monthly(LOSS_S[[m]])
   LAm <- take_monthly(LOSS_A[[m]])
-  list(
-    rmse = rmse_from_sq(LSm),
-    mae  = mae_from_abs(LAm),
-    mad  = mad_from_abs(LAm)
-  )
+  preds <- take_monthly(PRED[[m]])
+  actual_m <- take_monthly(Y_REAL[[m]])
+  if ((is.null(actual_m) || all(!is.finite(actual_m))) && !is.null(ACTUAL_REFERENCE)) {
+    actual_m <- take_monthly(ACTUAL_REFERENCE)
+  }
+
+  for (col in monthly_cols) {
+    pred_col <- if (!is.null(preds) && col %in% colnames(preds)) preds[, col] else NULL
+    actual_col <- if (!is.null(actual_m) && col %in% colnames(actual_m)) actual_m[, col] else NULL
+    if (!is.null(pred_col) && !is.null(actual_col)) {
+      err <- actual_col - pred_col
+      err <- err[is.finite(err)]
+      if (length(err)) {
+        rmse_vals[col] <- sqrt(mean(err^2))
+        mae_vals[col]  <- mean(abs(err))
+        mad_vals[col]  <- stats::median(abs(err))
+      }
+    }
+
+    if (is.na(rmse_vals[col]) && !is.null(LSm) && col %in% colnames(LSm)) {
+      se <- LSm[, col]
+      if (any(is.finite(se))) rmse_vals[col] <- sqrt(mean(se, na.rm = TRUE))
+    }
+
+    if (is.na(mae_vals[col]) && !is.null(LAm) && col %in% colnames(LAm)) {
+      ae <- LAm[, col]
+      if (any(is.finite(ae))) {
+        mae_vals[col] <- mean(ae, na.rm = TRUE)
+        mad_vals[col] <- stats::median(ae, na.rm = TRUE)
+      }
+    } else if (!is.na(mae_vals[col]) && is.na(mad_vals[col]) && !is.null(LAm) && col %in% colnames(LAm)) {
+      ae <- LAm[, col]
+      if (any(is.finite(ae))) mad_vals[col] <- stats::median(ae, na.rm = TRUE)
+    }
+  }
+
+  list(rmse = rmse_vals, mae = mae_vals, mad = mad_vals)
 }
 METRICS <- setNames(lapply(models, metrics_by_model), models)
 
@@ -569,16 +658,26 @@ build_table4 <- function(){
     
     mh_u <- mh_a <- NA_real_
     if (requireNamespace("MultiHorizonSPA", quietly = TRUE)) {
-      good_h <- which(vapply(1:12, function(h)
-        all(is.finite(LOSS_S[[rf_model]][, paste0("h",h)])) &&
-          all(is.finite(LOSS_S[[bm      ]][, paste0("h",h)])), TRUE))
-      if (length(good_h) >= 2) {
-        LD <- sapply(good_h, function(h)
-          LOSS_S[[rf_model]][, paste0("h",h)] - LOSS_S[[bm]][, paste0("h",h)])
-        mh_u <- try(MultiHorizonSPA::Test_uSPA(LossDiff = LD, L = 10, B = 999)$p_value, silent = TRUE)
-        mh_a <- try(MultiHorizonSPA::Test_aSPA(LossDiff = LD, weights = rep(1/ncol(LD), ncol(LD)), L = 10, B = 999)$p_value, silent = TRUE)
-        if (inherits(mh_u,"try-error")) mh_u <- NA_real_
-        if (inherits(mh_a,"try-error")) mh_a <- NA_real_
+      diff_info <- lapply(1:12, function(h){
+        hname <- paste0("h", h)
+        rf_col <- LOSS_S[[rf_model]][, hname]
+        bm_col <- LOSS_S[[bm]][, hname]
+        ok <- is.finite(rf_col) & is.finite(bm_col)
+        diff <- rf_col - bm_col
+        diff[!ok] <- NA_real_
+        list(name = hname, diff = diff, count = sum(ok))
+      })
+      keep <- Filter(function(x) is.list(x) && !is.null(x$count) && x$count >= 10, diff_info)
+      if (length(keep) >= 2) {
+        LD <- do.call(cbind, lapply(keep, `[[`, "diff"))
+        colnames(LD) <- vapply(keep, `[[`, character(1), "name")
+        LD <- LD[stats::complete.cases(LD), , drop = FALSE]
+        if (nrow(LD) >= 10 && ncol(LD) >= 2) {
+          mh_u <- try(MultiHorizonSPA::Test_uSPA(LossDiff = LD, L = 10, B = 999)$p_value, silent = TRUE)
+          mh_a <- try(MultiHorizonSPA::Test_aSPA(LossDiff = LD, weights = rep(1/ncol(LD), ncol(LD)), L = 10, B = 999)$p_value, silent = TRUE)
+          if (inherits(mh_u,"try-error")) mh_u <- NA_real_
+          if (inherits(mh_a,"try-error")) mh_a <- NA_real_
+        }
       }
     }
     tibble(
@@ -1016,17 +1115,44 @@ make_table1 <- function(){
   spa_sq <- SPA_sq |> dplyr::rename(spa_avg_sq = p_spa_avg)
   spa_ab <- SPA_ab |> dplyr::rename(spa_avg_ab = p_spa_avg)
   
-  mcs_avg_sq <- tibble(model = models, mcs_avg_sq = rowMeans(do.call(cbind, MCS_SQ), na.rm = TRUE))
-  mcs_avg_ab <- tibble(model = models, mcs_avg_ab = rowMeans(do.call(cbind, MCS_AB), na.rm = TRUE))
+  mcs_p_sq_mat <- NULL
+  if (length(MCS_P_sq)) {
+    tmp <- try(do.call(cbind, MCS_P_sq), silent = TRUE)
+    if (!inherits(tmp, "try-error")) mcs_p_sq_mat <- tmp
+  }
+  if (!is.null(dim(mcs_p_sq_mat))) {
+    mcs_p_sq_mat <- mcs_p_sq_mat[models, , drop = FALSE]
+  }
+  mcs_p_ab_mat <- NULL
+  if (length(MCS_P_ab)) {
+    tmp <- try(do.call(cbind, MCS_P_ab), silent = TRUE)
+    if (!inherits(tmp, "try-error")) mcs_p_ab_mat <- tmp
+  }
+  if (!is.null(dim(mcs_p_ab_mat))) {
+    mcs_p_ab_mat <- mcs_p_ab_mat[models, , drop = FALSE]
+  }
+  mcs_avg_sq <- tibble(model = models,
+                       mcs_avg_sq = if (is.null(dim(mcs_p_sq_mat))) NA_real_ else rowMeans(mcs_p_sq_mat, na.rm = TRUE))
+  mcs_avg_ab <- tibble(model = models,
+                       mcs_avg_ab = if (is.null(dim(mcs_p_ab_mat))) NA_real_ else rowMeans(mcs_p_ab_mat, na.rm = TRUE))
   
   mh_mcs <- try({
     if (requireNamespace("MultiHorizonSPA", quietly = TRUE)) {
       tibble(model = models, mh_mcs_sq = vapply(models, function(m){
-        good_h <- which(vapply(1:12, function(h)
-          all(is.finite(LOSS_S[[m]][, paste0("h",h)])) &&
-            all(is.finite(LOSS_S[[rw_model]][, paste0("h",h)])), TRUE))
-        if (length(good_h) < 2) return(NA_real_)
-        LD <- sapply(good_h, function(h) LOSS_S[[m]][, paste0("h",h)] - LOSS_S[[rw_model]][, paste0("h",h)])
+        diff_info <- lapply(1:12, function(h){
+          hname <- paste0("h", h)
+          mod_col <- LOSS_S[[m]][, hname]
+          rw_col  <- LOSS_S[[rw_model]][, hname]
+          ok <- is.finite(mod_col) & is.finite(rw_col)
+          diff <- mod_col - rw_col
+          diff[!ok] <- NA_real_
+          list(name = hname, diff = diff, count = sum(ok))
+        })
+        keep <- Filter(function(x) is.list(x) && !is.null(x$count) && x$count >= 10, diff_info)
+        if (length(keep) < 2) return(NA_real_)
+        LD <- do.call(cbind, lapply(keep, `[[`, "diff"))
+        LD <- LD[stats::complete.cases(LD), , drop = FALSE]
+        if (nrow(LD) < 10 || ncol(LD) < 2) return(NA_real_)
         out <- try(MultiHorizonSPA::Test_uSPA(LossDiff = LD, L = 10, B = 999)$p_value, silent = TRUE)
         if (inherits(out,"try-error")) NA_real_ else out
       }, 0.0))
