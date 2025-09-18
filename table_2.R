@@ -446,6 +446,55 @@ loss_matrix_at_h <- function(LS_or_LA, h, min_T = 10, eps_var = 1e-12){
   list(M = M[, good, drop = FALSE], keep_cols = good)
 }
 
+map_indices <- function(values, keep_cols, clean_names, template_names, type = c("logical","numeric")){
+  type <- match.arg(type)
+  if (is.null(template_names)) template_names <- character(length(keep_cols))
+  res <- if (type == "logical") rep(NA, length(template_names)) else rep(NA_real_, length(template_names))
+  names(res) <- template_names
+  if (!any(keep_cols)) return(res)
+
+  subset_names <- template_names[keep_cols]
+  if (is.null(clean_names) || !length(clean_names)) clean_names <- subset_names
+
+  norm <- if (type == "logical") rep(NA, length(clean_names)) else rep(NA_real_, length(clean_names))
+  names(norm) <- clean_names
+
+  if (!is.null(values)) {
+    if (type == "logical") {
+      if (is.logical(values) && length(values) == length(clean_names)) {
+        if (!is.null(names(values))) {
+          values <- values[clean_names]
+        }
+        norm <- as.logical(values)
+      } else if (is.numeric(values) && length(values) == length(clean_names) && is.null(names(values))) {
+        norm <- as.logical(values)
+      } else if (is.numeric(values) && !is.null(names(values))) {
+        nm <- intersect(names(values), clean_names)
+        norm[nm] <- as.logical(values[nm])
+      } else if (is.character(values)) {
+        nm <- intersect(values, clean_names)
+        norm[nm] <- TRUE
+      } else if (is.numeric(values) && length(values) <= length(clean_names) && all(values %in% seq_along(clean_names))) {
+        idx <- as.integer(values)
+        norm[idx] <- TRUE
+      }
+    } else {
+      if (is.numeric(values)) {
+        if (!is.null(names(values))) {
+          nm <- intersect(names(values), clean_names)
+          norm[nm] <- as.numeric(values[nm])
+        } else if (length(values) == length(clean_names)) {
+          norm <- as.numeric(values)
+        }
+      }
+    }
+  }
+
+  norm_subset <- norm[subset_names]
+  res[keep_cols] <- norm_subset
+  res
+}
+
 extract_mcs_membership <- function(obj, which_col = c("auto","MCS","MCS_M","MCS_R")){
   which_col <- match.arg(which_col)
   res <- NULL
@@ -477,59 +526,180 @@ extract_mcs_membership <- function(obj, which_col = c("auto","MCS","MCS_M","MCS_
   res
 }
 
-mcs_membership <- function(loss_mat_full, type = c("sq","ab")){
+extract_mcs_info <- function(out, M_clean, type = c("sq","ab")){
+  type <- match.arg(type)
+  info <- list(members = NULL, pvalues = NULL)
+  if (!methods::is(out, "MCS")) return(info)
+
+  clean_names <- colnames(M_clean)
+  sum_obj <- try(summary(out), silent = TRUE)
+  df <- NULL
+  if (!inherits(sum_obj, "try-error")) {
+    if (is.data.frame(sum_obj)) {
+      df <- sum_obj
+    } else if (is.list(sum_obj)) {
+      if (!is.null(sum_obj$result) && is.data.frame(sum_obj$result)) {
+        df <- sum_obj$result
+      } else {
+        candidates <- sum_obj[vapply(sum_obj, is.data.frame, logical(1))]
+        if (length(candidates) >= 1) df <- candidates[[1]]
+      }
+    }
+  }
+
+  if (!is.null(df) && nrow(df) > 0) {
+    cols <- colnames(df)
+    model_col <- intersect(c("Model","Models","model","models","Name","Series"), cols)[1]
+    mcs_col   <- intersect(c("MCS","Included","InMCS","Keep","Member","Indicator"), cols)[1]
+    p_col     <- intersect(c("pvalue","p_value","p.value","Pvalue","pval","p.val","PValue"), cols)[1]
+
+    if (!is.na(model_col)) {
+      models_raw <- df[[model_col]]
+      if (is.factor(models_raw)) models_raw <- as.character(models_raw)
+      if (is.numeric(models_raw)) {
+        idx <- as.integer(models_raw)
+        idx[idx < 1 | idx > length(clean_names)] <- NA_integer_
+        models_clean <- clean_names[idx]
+      } else {
+        models_clean <- as.character(models_raw)
+        models_clean <- trimws(models_clean)
+        matched <- match(models_clean, clean_names)
+        if (anyNA(matched) && length(clean_names)) {
+          matched2 <- match(tolower(models_clean), tolower(clean_names))
+          matched[is.na(matched)] <- matched2[is.na(matched)]
+        }
+        if (length(clean_names)) {
+          valid <- !is.na(matched)
+          models_clean[valid] <- clean_names[matched[valid]]
+        }
+      }
+
+      if (!is.na(mcs_col)) {
+        keep_vals <- df[[mcs_col]]
+        if (is.factor(keep_vals)) keep_vals <- as.character(keep_vals)
+        keep_idx <- rep(FALSE, length(models_clean))
+        if (is.character(keep_vals)) {
+          keep_idx <- tolower(trimws(keep_vals)) %in% c("1","yes","true","keep","mcs","included","in","member")
+        } else {
+          keep_num <- suppressWarnings(as.numeric(keep_vals))
+          keep_idx <- is.finite(keep_num) & keep_num > 0
+        }
+        members <- models_clean[keep_idx]
+        members <- unique(members[!is.na(members)])
+        if (length(members)) info$members <- members
+      }
+
+      if (!is.na(p_col)) {
+        pvals_raw <- df[[p_col]]
+        if (is.factor(pvals_raw)) pvals_raw <- as.character(pvals_raw)
+        pvals_num <- suppressWarnings(as.numeric(pvals_raw))
+        names(pvals_num) <- models_clean
+        pvals_num <- pvals_num[!is.na(names(pvals_num))]
+        if (length(pvals_num)) {
+          agg <- tapply(pvals_num, names(pvals_num), function(x) x[length(x)])
+          info$pvalues <- as.numeric(agg)
+          names(info$pvalues) <- names(agg)
+        }
+      }
+    }
+  }
+
+  if (is.null(info$members)) {
+    which_col <- if (type == "sq") "MCS_M" else "MCS_R"
+    info$members <- extract_mcs_membership(out, which_col = which_col)
+    if (is.null(info$members)) info$members <- extract_mcs_membership(out, which_col = "auto")
+  }
+
+  if (is.null(info$pvalues)) {
+    sn <- methods::slotNames(out)
+    for (snm in c("pvalues","pvalue","pMCS","pMCS_M","pMCS_R")) {
+      if (snm %in% sn) {
+        pvslot <- methods::slot(out, snm)
+        if (is.numeric(pvslot)) {
+          if (!is.null(names(pvslot))) {
+            info$pvalues <- pvslot
+          } else if (length(pvslot) == length(clean_names)) {
+            names(pvslot) <- clean_names
+            info$pvalues <- pvslot
+          }
+        } else if (is.list(pvslot) || is.data.frame(pvslot)) {
+          cand <- unlist(pvslot)
+          if (is.numeric(cand)) {
+            if (!is.null(names(cand))) {
+              info$pvalues <- cand
+            }
+          }
+        }
+      }
+      if (!is.null(info$pvalues)) break
+    }
+  }
+
+  info
+}
+
+mcs_compute <- function(loss_mat_full, type = c("sq","ab")){
   type <- match.arg(type)
   M <- loss_mat_full$M
   keep_cols <- loss_mat_full$keep_cols
-  
-  # Drop any rows with NA across kept models before running MCS
-  if (ncol(M) >= 2) {
-    M <- M[stats::complete.cases(M), , drop = FALSE]
+
+  template_names <- models
+  clean_names <- colnames(M)
+
+  if (!is.matrix(M) || ncol(M) < 1) {
+    members <- map_indices(NULL, keep_cols, clean_names, template_names, type = "logical")
+    pvals   <- map_indices(NULL, keep_cols, clean_names, template_names, type = "numeric")
+    return(list(members = members, pvalues = pvals))
   }
-  # Ensure unique, stable colnames (avoid check.names renaming)
-  if (anyDuplicated(colnames(M))) {
-    colnames(M) <- make.unique(colnames(M), sep = "_dup")
+
+  M_clean <- M
+  if (ncol(M_clean) >= 2) {
+    M_clean <- M_clean[stats::complete.cases(M_clean), , drop = FALSE]
   }
-  memb <- rep(NA, ncol(M))
-  
-  if (ncol(M) >= 2 && nrow(M) >= 10) {
-    out <- try({
-      suppressWarnings(
-        capture.output({
-          MCS::MCSprocedure(Loss = as.data.frame(M, check.names = FALSE),
-                            alpha = 0.5, B = 7500, statistic = "Tmax", cl = NULL)
-        }, file = NULL)
-      )
-    }, silent = TRUE)
-    
-    if (!inherits(out, "try-error") && !is.null(out)) {
-      pcol <- if (type == "sq") "MCS_M" else "MCS_R"
-      keep_models <- extract_mcs_membership(out, which_col = pcol)
-      if (is.null(keep_models)) keep_models <- extract_mcs_membership(out, which_col = "auto")
-      if (!is.null(keep_models)) memb <- colnames(M) %in% keep_models
-    }
+  if (anyDuplicated(colnames(M_clean))) {
+    colnames(M_clean) <- make.unique(colnames(M_clean), sep = "_dup")
   }
-  
-  # Expand back to full set aligned with 'models'
-  full_memb <- rep(NA, length(keep_cols))
-  if (sum(keep_cols) > 0) {
-    full_memb[keep_cols] <- memb
-    names(full_memb) <- models
-  } else {
-    names(full_memb) <- models
+
+  members_default <- map_indices(NULL, keep_cols, colnames(M_clean), template_names, type = "logical")
+  pvals_default   <- map_indices(NULL, keep_cols, colnames(M_clean), template_names, type = "numeric")
+
+  if (ncol(M_clean) < 2 || nrow(M_clean) < 10) {
+    return(list(members = members_default, pvalues = pvals_default))
   }
-  full_memb
+
+  out <- try({
+    suppressWarnings(
+      capture.output({
+        MCS::MCSprocedure(Loss = as.data.frame(M_clean, check.names = FALSE),
+                          alpha = 0.5, B = 7500, statistic = "Tmax", cl = NULL)
+      }, file = NULL)
+    )
+  }, silent = TRUE)
+
+  info <- list(members = NULL, pvalues = NULL)
+  if (!inherits(out, "try-error") && !is.null(out)) {
+    info <- extract_mcs_info(out, M_clean, type = type)
+  }
+
+  members <- map_indices(info$members, keep_cols, colnames(M_clean), template_names, type = "logical")
+  pvals   <- map_indices(info$pvalues, keep_cols, colnames(M_clean), template_names, type = "numeric")
+  list(members = members, pvalues = pvals)
 }
 
-MCS_SQ <- lapply(1:12, function(h) {
+MCS_INFO_SQ <- lapply(1:12, function(h) {
   loss_matrix <- loss_matrix_at_h(LOSS_S, h)
-  mcs_membership(loss_matrix, type = "sq")
+  mcs_compute(loss_matrix, type = "sq")
 })
-MCS_AB <- lapply(1:12, function(h) {
+MCS_INFO_AB <- lapply(1:12, function(h) {
   loss_matrix <- loss_matrix_at_h(LOSS_A, h)
-  mcs_membership(loss_matrix, type = "ab")
+  mcs_compute(loss_matrix, type = "ab")
 })
-names(MCS_SQ) <- names(MCS_AB) <- paste0("h",1:12)
+
+MCS_SQ    <- lapply(MCS_INFO_SQ, `[[`, "members")
+MCS_AB    <- lapply(MCS_INFO_AB, `[[`, "members")
+MCS_P_sq  <- lapply(MCS_INFO_SQ, `[[`, "pvalues")
+MCS_P_ab  <- lapply(MCS_INFO_AB, `[[`, "pvalues")
+names(MCS_SQ) <- names(MCS_AB) <- names(MCS_P_sq) <- names(MCS_P_ab) <- paste0("h",1:12)
 
 # ----------------------------- TABLE 2 (ratios) ---------------------------------
 make_table2 <- function(){
@@ -673,8 +843,8 @@ make_table1 <- function(){
   spa_sq <- SPA_sq |> dplyr::rename(spa_avg_sq = p_spa_avg)
   spa_ab <- SPA_ab |> dplyr::rename(spa_avg_ab = p_spa_avg)
   
-  mcs_avg_sq <- tibble(model = models, mcs_avg_sq = rowMeans(do.call(cbind, MCS_SQ), na.rm = TRUE))
-  mcs_avg_ab <- tibble(model = models, mcs_avg_ab = rowMeans(do.call(cbind, MCS_AB), na.rm = TRUE))
+  mcs_avg_sq <- tibble(model = models, mcs_avg_sq = rowMeans(do.call(cbind, MCS_P_sq), na.rm = TRUE))
+  mcs_avg_ab <- tibble(model = models, mcs_avg_ab = rowMeans(do.call(cbind, MCS_P_ab), na.rm = TRUE))
   
   mh_mcs <- try({
     if (requireNamespace("MultiHorizonSPA", quietly = TRUE)) {
