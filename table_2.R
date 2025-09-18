@@ -467,12 +467,14 @@ loss_matrix_at_h <- function(LS_or_LA, h, min_T = 10, eps_var = 1e-12){
     if (inherits(v, "try-error") || is.null(v)) rep(NA_real_, nprev) else v
   })
   M <- as.matrix(M)
+  colnames(M) <- models
   have_T  <- colSums(is.finite(M)) >= min_T
   var_ok  <- apply(M, 2, function(col){
     x <- col[is.finite(col)]
     length(x) >= min_T && length(unique(x)) >= 2 && is.finite(stats::var(x)) && stats::var(x) > eps_var
   })
   good <- have_T & var_ok
+  names(good) <- models
   list(M = M[, good, drop = FALSE], keep_cols = good)
 }
 
@@ -561,45 +563,105 @@ extract_mcs_info <- function(obj){
   info
 }
 
-mcs_compute <- function(loss_mat_full){
+mcs_compute <- function(loss_mat_full, min_T = 10){
   M <- loss_mat_full$M
-  keep_cols <- loss_mat_full$keep_cols
+  keep_cols <- as.logical(loss_mat_full$keep_cols)
   full_memb <- rep(NA, length(keep_cols))
   full_pv   <- rep(NA_real_, length(keep_cols))
   names(full_memb) <- names(full_pv) <- models
 
-  if (ncol(M) >= 2) {
-    finite_mat <- is.finite(M)
-    keep_rows <- rowSums(finite_mat) == ncol(M)
-    M_clean <- M[keep_rows, , drop = FALSE]
-    var_cols <- apply(M_clean, 2, function(col) {
-      v <- stats::var(col)
-      is.finite(v) && v > 0
-    })
-    if (nrow(M_clean) >= 10 && all(var_cols)) {
-      out <- NULL
-      suppressWarnings(capture.output({
-        out <- MCS::MCSprocedure(Loss = as.data.frame(M_clean), alpha = 0.5, B = 5000,
-                                 statistic = "Tmax", cl = NULL)
-      }, file = NULL))
-      if (!is.null(out)) {
-        info <- extract_mcs_info(out)
-        memb_short <- rep(FALSE, ncol(M_clean))
-        if (length(info$members)) {
-          memb_short <- colnames(M_clean) %in% info$members
-        }
-        pv_short <- rep(NA_real_, ncol(M_clean))
-        if (length(info$pvalues)) {
-          idx <- match(colnames(M_clean), names(info$pvalues))
-          valid <- !is.na(idx)
-          if (any(valid)) pv_short[valid] <- info$pvalues[idx[valid]]
-        }
-        # map back to full vector respecting keep_cols mask
-        full_memb[keep_cols] <- memb_short
-        full_pv[keep_cols]   <- pv_short
-      }
-    }
+  col_idx <- which(keep_cols)
+  if (length(col_idx) == 0L) {
+    return(list(membership = full_memb, pvalues = full_pv))
   }
+
+  nc <- ncol(M)
+  if (is.null(nc) || nc == 0L) {
+    return(list(membership = full_memb, pvalues = full_pv))
+  }
+
+  if (nc == 1L) {
+    full_memb[col_idx] <- TRUE
+    full_pv[col_idx]   <- 1
+    return(list(membership = full_memb, pvalues = full_pv))
+  }
+
+  finite_mat <- is.finite(M)
+  keep_rows <- rowSums(finite_mat) == ncol(M)
+  M_clean <- M[keep_rows, , drop = FALSE]
+  if (nrow(M_clean) < min_T) {
+    return(list(membership = full_memb, pvalues = full_pv))
+  }
+
+  var_cols <- apply(M_clean, 2, function(col) {
+    v <- stats::var(col)
+    is.finite(v) && v > 0
+  })
+  if (sum(var_cols) == 0L) {
+    return(list(membership = full_memb, pvalues = full_pv))
+  }
+  if (sum(var_cols) == 1L) {
+    full_memb[col_idx[var_cols]] <- TRUE
+    full_pv[col_idx[var_cols]]   <- 1
+    return(list(membership = full_memb, pvalues = full_pv))
+  }
+  if (!all(var_cols)) {
+    M_clean <- M_clean[, var_cols, drop = FALSE]
+    col_idx <- col_idx[var_cols]
+  }
+
+  col_labels <- colnames(M_clean)
+  if (is.null(col_labels)) col_labels <- models[col_idx]
+  col_labels[is.na(col_labels) | col_labels == ""] <- paste0("model_", seq_along(col_labels))
+  uniq_labels <- make.unique(col_labels, sep = "__dup")
+  pos_map <- setNames(seq_along(uniq_labels), uniq_labels)
+  colnames(M_clean) <- uniq_labels
+
+  map_indices <- function(keys){
+    keys <- as.character(keys)
+    keys <- keys[!is.na(keys) & nzchar(keys)]
+    if (!length(keys)) return(integer(0))
+    idx <- pos_map[keys]
+    miss <- which(is.na(idx))
+    if (length(miss)) {
+      alt <- match(keys[miss], col_labels)
+      idx[miss] <- alt
+    }
+    idx
+  }
+
+  out <- NULL
+  suppressWarnings(capture.output({
+    out <- try(MCS::MCSprocedure(Loss = as.data.frame(M_clean, check.names = FALSE),
+                                 alpha = 0.5, B = 5000, statistic = "Tmax", cl = NULL),
+                   silent = TRUE)
+  }, file = NULL))
+  if (inherits(out, "try-error") || is.null(out)) {
+    return(list(membership = full_memb, pvalues = full_pv))
+  }
+
+  info <- extract_mcs_info(out)
+  memb_short <- rep(FALSE, length(col_idx))
+  if (length(info$members)) {
+    idx <- map_indices(info$members)
+    idx <- idx[!is.na(idx)]
+    if (length(idx)) {
+      memb_short[idx] <- TRUE
+    } else if (!length(info$pvalues)) {
+      memb_short[] <- NA
+    }
+  } else if (!length(info$pvalues)) {
+    memb_short[] <- NA
+  }
+  pv_short <- rep(NA_real_, length(col_idx))
+  if (length(info$pvalues)) {
+    idx <- map_indices(names(info$pvalues))
+    valid <- !is.na(idx)
+    if (any(valid)) pv_short[idx[valid]] <- info$pvalues[valid]
+  }
+
+  full_memb[col_idx] <- memb_short
+  full_pv[col_idx]   <- pv_short
 
   list(membership = full_memb, pvalues = full_pv)
 }
