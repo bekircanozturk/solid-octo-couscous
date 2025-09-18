@@ -117,19 +117,45 @@ read_model_file <- function(path){
   
   LA_mat <- matrix(NA_real_, nrow = nprev, ncol = H)
   LS_mat <- matrix(NA_real_, nrow = nprev, ncol = H)
-  
+  P_mat  <- matrix(NA_real_, nrow = nprev, ncol = H)
+  Y_mat  <- matrix(NA_real_, nrow = nprev, ncol = H)
+
   if (H == 15) {
     coln <- c(paste0("h", 1:12), "acc3", "acc6", "acc12")
   } else {
     coln <- paste0("h", seq_len(H))
   }
   colnames(LA_mat) <- colnames(LS_mat) <- coln
-  
+  colnames(P_mat)  <- colnames(Y_mat)  <- coln
+
   for (h in seq_len(H)) {
     if (!is.null(obj[[h]]$loss_abs)) LA_mat[seq_along(obj[[h]]$loss_abs), h] <- obj[[h]]$loss_abs
     if (!is.null(obj[[h]]$loss_sq )) LS_mat[seq_along(obj[[h]]$loss_sq ), h] <- obj[[h]]$loss_sq
+
+    if (!is.null(obj[[h]]$pred)) {
+      P_mat[seq_along(obj[[h]]$pred), h] <- obj[[h]]$pred
+    }
+
+    if (is.null(obj[[h]]$pred) && !is.null(obj[[h]]$forecast)) {
+      P_mat[seq_along(obj[[h]]$forecast), h] <- obj[[h]]$forecast
+    }
+
+    get_actual <- NULL
+    for (cand in c("y", "y_real", "real", "actual", "obs", "target", "Y", "Real")) {
+      if (!is.null(obj[[h]][[cand]])) {
+        get_actual <- obj[[h]][[cand]]
+        break
+      }
+    }
+    if (!is.null(get_actual)) {
+      Y_mat[seq_along(get_actual), h] <- get_actual
+    }
   }
-  list(y_real = NULL, P = NULL, loss_abs = LA_mat, loss_sq = LS_mat)
+
+  if (all(is.na(P_mat))) P_mat <- NULL
+  if (all(is.na(Y_mat))) Y_mat <- NULL
+
+  list(y_real = Y_mat, pred = P_mat, loss_abs = LA_mat, loss_sq = LS_mat)
 }
 
 load_model <- function(rds_path, csv_path){
@@ -161,12 +187,136 @@ get_by_model <- function(field){
 }
 LOSS_A <- get_by_model("loss_abs")  # list of matrices nprev x (12 or 15)
 LOSS_S <- get_by_model("loss_sq")
+PRED   <- get_by_model("pred")
+Y_REAL <- get_by_model("y_real")
 
 # Use RW to set base dims for monthly horizons
 stopifnot(!is.null(LOSS_S[[rw_model]]), !is.null(LOSS_A[[rw_model]]))
 nprev <- nrow(LOSS_S[[rw_model]])
 horizons_monthly <- paste0("h", 1:12)
 acc_horizons     <- c(3,6,12)  # accumulated targets
+
+# -------------------------- Ensemble (mean/median/trim) -------------------------
+normalize_pred_matrix <- function(mat, reference_cols){
+  if (is.null(mat)) return(NULL)
+  if (!is.matrix(mat)) mat <- as.matrix(mat)
+  if (is.null(colnames(mat)) && length(reference_cols) == ncol(mat)) {
+    colnames(mat) <- reference_cols
+  }
+  mat
+}
+
+extract_reference_actual <- function(){
+  for (nm in models) {
+    mat <- Y_REAL[[nm]]
+    if (is.matrix(mat) && any(is.finite(mat))) {
+      return(list(actual = mat, source = nm))
+    }
+  }
+  NULL
+}
+
+ref_info <- extract_reference_actual()
+
+if (!is.null(ref_info)) {
+  actual_ref <- ref_info$actual
+  if (!is.null(actual_ref) && !is.matrix(actual_ref)) actual_ref <- as.matrix(actual_ref)
+  if (is.null(colnames(actual_ref))) {
+    ref_cols <- colnames(LOSS_S[[ref_info$source]])
+    if (!is.null(ref_cols)) colnames(actual_ref) <- ref_cols
+  }
+  ref_cols <- colnames(actual_ref)
+  if (is.null(ref_cols)) ref_cols <- colnames(LOSS_S[[rw_model]])
+  if (!is.null(actual_ref) && nrow(actual_ref) < nprev) {
+    actual_ref <- rbind(actual_ref, matrix(NA_real_, nprev - nrow(actual_ref), ncol(actual_ref)))
+  }
+  if (!is.null(actual_ref) && nrow(actual_ref) > nprev) {
+    actual_ref <- actual_ref[seq_len(nprev), , drop = FALSE]
+  }
+  base_models <- models
+  for (nm in base_models) {
+    PRED[[nm]] <- normalize_pred_matrix(PRED[[nm]], ref_cols)
+  }
+
+  build_ensemble <- function(fun){
+    if (is.null(ref_cols)) return(NULL)
+    pred_mat <- matrix(NA_real_, nrow = nprev, ncol = length(ref_cols),
+                       dimnames = list(NULL, ref_cols))
+    loss_sq  <- pred_mat
+    loss_ab  <- pred_mat
+    for (col in ref_cols) {
+      preds <- sapply(base_models, function(m) {
+        mat <- PRED[[m]]
+        if (is.null(mat)) return(rep(NA_real_, nprev))
+        if (!(col %in% colnames(mat))) return(rep(NA_real_, nprev))
+        vec <- mat[, col]
+        if (length(vec) < nprev) vec <- c(vec, rep(NA_real_, nprev - length(vec)))
+        else if (length(vec) > nprev) vec <- vec[seq_len(nprev)]
+        vec
+      })
+      if (!is.matrix(preds)) preds <- matrix(preds, ncol = 1)
+      actual <- actual_ref[, col]
+      if (all(!is.finite(preds)) || all(!is.finite(actual))) {
+        next
+      }
+      pred_col <- fun(preds)
+      if (length(pred_col) != nprev) {
+        pred_col <- rep(NA_real_, nprev)
+      }
+      err <- actual - pred_col
+      pred_mat[, col] <- pred_col
+      loss_sq[, col]  <- err^2
+      loss_ab[, col]  <- abs(err)
+    }
+    list(pred = pred_mat, loss_sq = loss_sq, loss_abs = loss_ab)
+  }
+
+  row_stat <- function(mat, fn){
+    apply(mat, 1, fn)
+  }
+
+  mean_fun <- function(preds){
+    res <- rowMeans(preds, na.rm = TRUE)
+    res[is.nan(res)] <- NA_real_
+    res
+  }
+  median_fun <- function(preds){
+    row_stat(preds, function(x){
+      x <- x[is.finite(x)]
+      if (!length(x)) return(NA_real_)
+      stats::median(x)
+    })
+  }
+  trim_fun <- function(preds){
+    row_stat(preds, function(x){
+      x <- x[is.finite(x)]
+      if (!length(x)) return(NA_real_)
+      mean(x, trim = 0.1)
+    })
+  }
+
+  ensembles <- list(
+    `mean` = build_ensemble(mean_fun),
+    `median` = build_ensemble(median_fun),
+    `trimmed mean` = build_ensemble(trim_fun)
+  )
+
+  added_ensembles <- character(0)
+  for (nm in names(ensembles)) {
+    ens <- ensembles[[nm]]
+    if (is.null(ens)) next
+    if (all(is.na(ens$loss_sq)) && all(is.na(ens$loss_abs))) next
+    if (nm %in% models) next
+    LOSS_S[[nm]] <- ens$loss_sq
+    LOSS_A[[nm]] <- ens$loss_abs
+    PRED[[nm]]   <- ens$pred
+    added_ensembles <- c(added_ensembles, nm)
+  }
+
+  if (length(added_ensembles)) models <- c(models, added_ensembles)
+} else {
+  warning("No actual series found among models; ensemble rows will be skipped.")
+}
 
 # -------------------------- METRICS & RATIOS (for Tables 1,2,5) ------------------
 take_monthly <- function(M) {
@@ -446,42 +596,150 @@ loss_matrix_at_h <- function(LS_or_LA, h, min_T = 10, eps_var = 1e-12){
   list(M = M[, good, drop = FALSE], keep_cols = good)
 }
 
-extract_mcs_membership <- function(obj, which_col = c("auto","MCS","MCS_M","MCS_R")){
-  which_col <- match.arg(which_col)
-  res <- NULL
-  if (methods::is(obj, "MCS")) {
-    sn <- methods::slotNames(obj)
-    if ("MCS" %in% sn) {
-      MCSslot <- methods::slot(obj, "MCS")
-      if (is.data.frame(MCSslot) || is.matrix(MCSslot)) {
-        rn <- rownames(MCSslot)
-        cols <- colnames(MCSslot)
-        pick_col <- if (which_col == "auto") intersect(c("MCS","MCS_M","MCS_R"), cols)[1] else intersect(which_col, cols)[1]
-        if (!is.na(pick_col) && length(pick_col)) {
-          keep_models <- rn[ MCSslot[, pick_col, drop = TRUE] == 1 ]
-          res <- keep_models
-        } else {
-          res <- rn[ apply(MCSslot, 1, function(row) any(row == 1, na.rm = TRUE)) ]
-        }
-      }
-    }
-    if (is.null(res)) {
-      for (snm in c("SSM","Superior","models","Model")) {
-        if (snm %in% sn) {
-          obj2 <- methods::slot(obj, snm)
-          if (is.character(obj2)) { res <- obj2; break }
-        }
+stationary_bootstrap_indices <- function(Tn, B, p = 0.1){
+  if (Tn <= 0) stop("Sample size must be positive for stationary bootstrap.")
+  idx <- matrix(1L, nrow = Tn, ncol = B)
+  if (Tn == 1L) return(idx)
+  for (b in seq_len(B)) {
+    t <- 1L
+    while (t <= Tn) {
+      start <- sample.int(Tn, 1L)
+      block_len <- rgeom(1L, p) + 1L
+      for (k in seq_len(block_len)) {
+        if (t > Tn) break
+        idx[t, b] <- ((start - 1L + (k - 1L)) %% Tn) + 1L
+        t <- t + 1L
       }
     }
   }
-  res
+  idx
+}
+
+modelconf_d_series <- function(M){
+  m <- ncol(M)
+  out <- matrix(NA_real_, nrow = nrow(M), ncol = m, dimnames = list(NULL, colnames(M)))
+  for (i in seq_len(m)) {
+    others <- setdiff(seq_len(m), i)
+    if (!length(others)) next
+    diffs <- sweep(M[, others, drop = FALSE], 1, M[, i], FUN = "-")
+    out[, i] <- rowMeans(diffs)
+  }
+  out
+}
+
+modelconf_pairwise_series <- function(M){
+  if (ncol(M) < 2) {
+    return(list(series = matrix(NA_real_, nrow = nrow(M), ncol = 0), combos = matrix(integer(0), nrow = 2)))
+  }
+  cmb <- utils::combn(seq_len(ncol(M)), 2)
+  coln <- apply(cmb, 2, function(idx) paste0(colnames(M)[idx], collapse = "::"))
+  arr <- matrix(NA_real_, nrow = nrow(M), ncol = ncol(cmb), dimnames = list(NULL, coln))
+  for (k in seq_len(ncol(cmb))) {
+    i <- cmb[1, k]; j <- cmb[2, k]
+    arr[, k] <- M[, i] - M[, j]
+  }
+  list(series = arr, combos = cmb)
+}
+
+modelconf_statistic <- function(M, statistic = c("Tmax","TR")){
+  statistic <- match.arg(statistic)
+  Tn <- nrow(M)
+  if (statistic == "Tmax") {
+    d_series <- modelconf_d_series(M)
+    dbar <- colMeans(d_series)
+    sdv  <- apply(d_series, 2, stats::sd)
+    valid <- is.finite(dbar) & is.finite(sdv) & sdv > 0
+    t_obs <- rep(NA_real_, length(dbar))
+    if (any(valid)) t_obs[valid] <- sqrt(Tn) * dbar[valid] / sdv[valid]
+    T_obs <- if (any(valid)) max(t_obs[valid], na.rm = TRUE) else NA_real_
+    list(statistic = "Tmax", series = d_series, dbar = dbar, sdv = sdv, t_obs = t_obs, T_obs = T_obs)
+  } else {
+    pw <- modelconf_pairwise_series(M)
+    dbar <- colMeans(pw$series)
+    sdv  <- apply(pw$series, 2, stats::sd)
+    valid <- is.finite(dbar) & is.finite(sdv) & sdv > 0
+    t_obs <- rep(NA_real_, length(dbar))
+    if (any(valid)) t_obs[valid] <- sqrt(Tn) * dbar[valid] / sdv[valid]
+    T_obs <- if (any(valid)) max(abs(t_obs[valid]), na.rm = TRUE) else NA_real_
+    list(statistic = "TR", series = pw$series, dbar = dbar, sdv = sdv, t_obs = t_obs, T_obs = T_obs, combos = pw$combos)
+  }
+}
+
+modelconf_bootstrap_stat <- function(stat_obj, idx){
+  series_b <- stat_obj$series[idx, , drop = FALSE]
+  dbar_b <- if (ncol(series_b)) colMeans(series_b) else numeric(0)
+  if (!length(stat_obj$sdv)) return(NA_real_)
+  valid <- is.finite(stat_obj$sdv) & stat_obj$sdv > 0
+  if (!length(dbar_b) || !any(valid)) return(NA_real_)
+  Tn <- nrow(stat_obj$series)
+  t_b <- rep(NA_real_, length(dbar_b))
+  t_b[valid] <- sqrt(Tn) * (dbar_b[valid] - stat_obj$dbar[valid]) / stat_obj$sdv[valid]
+  if (stat_obj$statistic == "Tmax") max(t_b[valid], na.rm = TRUE) else max(abs(t_b[valid]), na.rm = TRUE)
+}
+
+modelconf_single_mcs <- function(M, alpha = 0.1, B = 5000, statistic = "Tmax", boot_p = 0.1){
+  M <- as.matrix(M)
+  if (is.null(colnames(M))) colnames(M) <- paste0("model", seq_len(ncol(M)))
+  all_models <- colnames(M)
+  membership <- setNames(rep(FALSE, length(all_models)), all_models)
+  pvals      <- setNames(rep(NA_real_, length(all_models)), all_models)
+  last_p <- NA_real_
+  current <- M
+
+  while (ncol(current) >= 1) {
+    if (ncol(current) == 1) {
+      survivors <- colnames(current)
+      membership[survivors] <- TRUE
+      if (is.na(pvals[survivors])) pvals[survivors] <- ifelse(is.na(last_p), 1, last_p)
+      break
+    }
+
+    stat_obj <- modelconf_statistic(current, statistic)
+    if (!is.finite(stat_obj$T_obs)) {
+      membership[colnames(current)] <- TRUE
+      break
+    }
+
+    boot_idx <- stationary_bootstrap_indices(nrow(current), B, boot_p)
+    boot_vals <- apply(boot_idx, 2, function(id) modelconf_bootstrap_stat(stat_obj, id))
+    boot_vals <- boot_vals[is.finite(boot_vals)]
+    if (!length(boot_vals)) {
+      membership[colnames(current)] <- TRUE
+      break
+    }
+
+    pval <- mean(boot_vals >= stat_obj$T_obs)
+    last_p <- pval
+
+    if (!is.finite(pval) || is.na(pval) || pval > alpha) {
+      survivors <- colnames(current)
+      membership[survivors] <- TRUE
+      pvals[survivors][is.na(pvals[survivors])] <- pval
+      break
+    }
+
+    worst_idx <- which.max(colMeans(current))
+    worst_model <- colnames(current)[worst_idx]
+    pvals[worst_model] <- pval
+    membership[worst_model] <- FALSE
+    current <- current[, -worst_idx, drop = FALSE]
+    if (!ncol(current)) break
+  }
+
+  survivors <- names(membership)[membership]
+  if (length(survivors)) {
+    fill <- if (is.na(last_p)) 1 else last_p
+    pvals[survivors][is.na(pvals[survivors])] <- fill
+  }
+
+  list(membership = membership, pvalues = pvals, last_pvalue = last_p)
 }
 
 mcs_membership <- function(loss_mat_full, type = c("sq","ab")){
   type <- match.arg(type)
   M <- loss_mat_full$M
   keep_cols <- loss_mat_full$keep_cols
-  
+
   # Drop any rows with NA across kept models before running MCS
   if (ncol(M) >= 2) {
     M <- M[stats::complete.cases(M), , drop = FALSE]
@@ -491,45 +749,45 @@ mcs_membership <- function(loss_mat_full, type = c("sq","ab")){
     colnames(M) <- make.unique(colnames(M), sep = "_dup")
   }
   memb <- rep(NA, ncol(M))
-  
+  pvals <- rep(NA_real_, ncol(M))
+
   if (ncol(M) >= 2 && nrow(M) >= 10) {
-    out <- try({
-      suppressWarnings(
-        capture.output({
-          MCS::MCSprocedure(Loss = as.data.frame(M, check.names = FALSE),
-                            alpha = 0.5, B = 7500, statistic = "Tmax", cl = NULL)
-        }, file = NULL)
-      )
-    }, silent = TRUE)
-    
-    if (!inherits(out, "try-error") && !is.null(out)) {
-      pcol <- if (type == "sq") "MCS_M" else "MCS_R"
-      keep_models <- extract_mcs_membership(out, which_col = pcol)
-      if (is.null(keep_models)) keep_models <- extract_mcs_membership(out, which_col = "auto")
-      if (!is.null(keep_models)) memb <- colnames(M) %in% keep_models
-    }
+    res <- modelconf_single_mcs(M, alpha = 0.1, B = 5000, statistic = "Tmax", boot_p = 0.1)
+    memb <- res$membership[colnames(M)]
+    pvals <- res$pvalues[colnames(M)]
+  } else if (ncol(M) == 1) {
+    memb <- setNames(rep(TRUE, ncol(M)), colnames(M))
+    pvals <- setNames(rep(1, ncol(M)), colnames(M))
   }
-  
+
   # Expand back to full set aligned with 'models'
   full_memb <- rep(NA, length(keep_cols))
+  full_pvals <- rep(NA_real_, length(keep_cols))
+  names(full_memb) <- names(full_pvals) <- names(keep_cols)
   if (sum(keep_cols) > 0) {
     full_memb[keep_cols] <- memb
-    names(full_memb) <- models
-  } else {
-    names(full_memb) <- models
+    full_pvals[keep_cols] <- pvals
   }
-  full_memb
+
+  list(membership = full_memb, pvalues = full_pvals)
 }
 
-MCS_SQ <- lapply(1:12, function(h) {
-  loss_matrix <- loss_matrix_at_h(LOSS_S, h)
-  mcs_membership(loss_matrix, type = "sq")
-})
-MCS_AB <- lapply(1:12, function(h) {
-  loss_matrix <- loss_matrix_at_h(LOSS_A, h)
-  mcs_membership(loss_matrix, type = "ab")
-})
-names(MCS_SQ) <- names(MCS_AB) <- paste0("h",1:12)
+MCS_SQ <- list()
+MCS_AB <- list()
+MCS_P_sq <- list()
+MCS_P_ab <- list()
+for (h in 1:12) {
+  loss_matrix_sq <- loss_matrix_at_h(LOSS_S, h)
+  res_sq <- mcs_membership(loss_matrix_sq, type = "sq")
+  MCS_SQ[[h]] <- res_sq$membership
+  MCS_P_sq[[h]] <- res_sq$pvalues
+
+  loss_matrix_ab <- loss_matrix_at_h(LOSS_A, h)
+  res_ab <- mcs_membership(loss_matrix_ab, type = "ab")
+  MCS_AB[[h]] <- res_ab$membership
+  MCS_P_ab[[h]] <- res_ab$pvalues
+}
+names(MCS_SQ) <- names(MCS_AB) <- names(MCS_P_sq) <- names(MCS_P_ab) <- paste0("h",1:12)
 
 # ----------------------------- TABLE 2 (ratios) ---------------------------------
 make_table2 <- function(){
