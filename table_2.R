@@ -230,7 +230,7 @@ spa_pvalue_one_h <- function(loss_mat, b, B = 2000, geom_p = 1/10){
   L0 <- loss_mat[, b]
   La <- loss_mat[, -b, drop = FALSE]
   if (ncol(La) == 0) return(NA_real_)
-  D  <- sweep(La, 1, L0, FUN = "-")   # improvements: positive = alt better than benchmark
+  D  <- sweep(La, 1, L0, FUN = "-")   # positive => competitor loss above benchmark (benchmark better)
   Tn <- nrow(D)
   mu_hat <- colMeans(D, na.rm = TRUE)
   mu_plus <- pmax(mu_hat, 0)
@@ -294,15 +294,15 @@ SPA_sq <- spa_avg_pvals(LOSS_S, include_acc = acc_horizons, B = 1000)
 SPA_ab <- spa_avg_pvals(LOSS_A, include_acc = acc_horizons, B = 1000)
 
 # ----------------------- Giacomini–White (GW) & Multi-Horizon SPA (Table 4) -----
-gw_pval <- function(loss_A, loss_B, alternative = c("two.sided","less","greater")){
+gw_pval <- function(loss_benchmark, loss_rf, alternative = c("greater","two.sided","less")){
   alternative <- match.arg(alternative)
 
-  a <- as.numeric(loss_A)
-  b <- as.numeric(loss_B)
-  ok <- is.finite(a) & is.finite(b)
+  b <- as.numeric(loss_benchmark)
+  r <- as.numeric(loss_rf)
+  ok <- is.finite(b) & is.finite(r)
   if (!any(ok)) return(NA_real_)
 
-  d <- a[ok] - b[ok]                          # >0 => A worse than B
+  d <- b[ok] - r[ok]                          # >0 => benchmark worse, RF better
   n <- length(d)
   if (n < 8) return(NA_real_)
 
@@ -333,12 +333,14 @@ build_table4 <- function(){
   if (length(present_bench) == 0) return(NULL)
   
   tbl <- lapply(present_bench, function(bm){
-    p_sq <- vapply(1:12, function(h) gw_pval(LOSS_S[[rf_model]][, paste0("h",h)], LOSS_S[[bm]][, paste0("h",h)], "two.sided"), 0.0)
-    p_ab <- vapply(1:12, function(h) gw_pval(LOSS_A[[rf_model]][, paste0("h",h)], LOSS_A[[bm]][, paste0("h",h)], "two.sided"), 0.0)
+    p_sq <- vapply(1:12, function(h)
+      gw_pval(LOSS_S[[bm]][, paste0("h",h)], LOSS_S[[rf_model]][, paste0("h",h)], "greater"), 0.0)
+    p_ab <- vapply(1:12, function(h)
+      gw_pval(LOSS_A[[bm]][, paste0("h",h)], LOSS_A[[rf_model]][, paste0("h",h)], "greater"), 0.0)
     p_sq_acc <- vapply(acc_horizons, function(k)
-      gw_pval(acc_loss_vec(LOSS_S[[rf_model]], k), acc_loss_vec(LOSS_S[[bm]], k), "two.sided"), 0.0)
+      gw_pval(acc_loss_vec(LOSS_S[[bm]], k), acc_loss_vec(LOSS_S[[rf_model]], k), "greater"), 0.0)
     p_ab_acc <- vapply(acc_horizons, function(k)
-      gw_pval(acc_loss_vec(LOSS_A[[rf_model]], k), acc_loss_vec(LOSS_A[[bm]], k), "two.sided"), 0.0)
+      gw_pval(acc_loss_vec(LOSS_A[[bm]], k), acc_loss_vec(LOSS_A[[rf_model]], k), "greater"), 0.0)
     
     mh_u_sq <- mh_a_sq <- mh_u_ab <- mh_a_ab <- NA_real_
     min_T <- 10
@@ -350,9 +352,9 @@ build_table4 <- function(){
       }, TRUE))
       if (length(good_h_sq) >= 2) {
         LD_sq <- sapply(good_h_sq, function(h) {
-          a <- LOSS_S[[rf_model]][, paste0("h",h)]
           b <- LOSS_S[[bm      ]][, paste0("h",h)]
-          a - b
+          a <- LOSS_S[[rf_model]][, paste0("h",h)]
+          b - a
         })
         LD_sq <- as.matrix(LD_sq)
         keep_rows <- apply(LD_sq, 1, function(row) all(is.finite(row)))
@@ -372,9 +374,9 @@ build_table4 <- function(){
       }, TRUE))
       if (length(good_h_ab) >= 2) {
         LD_ab <- sapply(good_h_ab, function(h) {
-          a <- LOSS_A[[rf_model]][, paste0("h",h)]
           b <- LOSS_A[[bm      ]][, paste0("h",h)]
-          a - b
+          a <- LOSS_A[[rf_model]][, paste0("h",h)]
+          b - a
         })
         LD_ab <- as.matrix(LD_ab)
         keep_rows_ab <- apply(LD_ab, 1, function(row) all(is.finite(row)))
