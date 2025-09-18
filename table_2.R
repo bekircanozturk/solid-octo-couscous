@@ -2,7 +2,7 @@
 # Project layout expected:
 #   forecasts/<model>/*-list-<series>.RData|.Rdata|.rds   (primary; list of 12 elems w/ loss_abs, loss_sq)
 #   forecasts/<model>/<model>_<series>.csv                (optional; preds only, not required here)
-# Outputs (LaTeX): tables_out/<series>/*.tex
+# Outputs (LaTeX & TXT): tables_out2/<series>/*
 
 suppressPackageStartupMessages({
   library(tidyverse)   # purrr/dplyr/readr/tibble
@@ -18,7 +18,7 @@ suppressPackageStartupMessages({
 # ---------------------------- USER CONFIG ---------------------------------------
 root_dir        <- "forecasts"            # where model folders live
 series          <- "cpi_total"            # target series name key used in filenames
-out_dir         <- file.path("tables_out", series)
+out_dir         <- file.path("tables_out2", series)
 dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
 
 # Which model names in folder match these roles:
@@ -296,17 +296,34 @@ SPA_ab <- spa_avg_pvals(LOSS_A, include_acc = acc_horizons, B = 1000)
 # ----------------------- Giacomini–White (GW) & Multi-Horizon SPA (Table 4) -----
 gw_pval <- function(loss_A, loss_B, alternative = c("two.sided","less","greater")){
   alternative <- match.arg(alternative)
-  d <- loss_A - loss_B                    # >0 => A worse than B
-  d <- d[is.finite(d)]
-  if (length(d) < 8) return(NA_real_)
-  meat <- try(sandwich::kernHAC(ts(d), kernel = "QS", bw = bwAndrews, prewhite = FALSE), silent = TRUE)
-  if (inherits(meat, "try-error")) return(NA_real_)
-  se <- sqrt(as.numeric(meat) / length(d))
-  if (!is.finite(se) || se == 0) return(NA_real_)
-  t  <- mean(d) / se
-  if (alternative == "two.sided") 2 * (1 - pnorm(abs(t)))
-  else if (alternative == "less")  pnorm(t)
-  else                            (1 - pnorm(t))
+
+  a <- as.numeric(loss_A)
+  b <- as.numeric(loss_B)
+  ok <- is.finite(a) & is.finite(b)
+  if (!any(ok)) return(NA_real_)
+
+  d <- a[ok] - b[ok]                          # >0 => A worse than B
+  n <- length(d)
+  if (n < 8) return(NA_real_)
+
+  fit <- try(stats::lm(d ~ 1), silent = TRUE)
+  if (inherits(fit, "try-error")) return(NA_real_)
+
+  V <- try(
+    sandwich::kernHAC(fit, kernel = "Quadratic Spectral", bw = bwAndrews, prewhite = FALSE),
+    silent = TRUE
+  )
+  if (inherits(V, "try-error")) {
+    V <- try(sandwich::NeweyWest(fit, prewhite = FALSE, adjust = TRUE), silent = TRUE)
+    if (inherits(V, "try-error")) return(NA_real_)
+  }
+  se <- sqrt(V[1, 1])
+  if (!is.finite(se) || se <= 0) return(NA_real_)
+
+  t  <- coef(fit)[1] / se
+  if (alternative == "two.sided") 2 * (1 - stats::pnorm(abs(t)))
+  else if (alternative == "less")  stats::pnorm(t)
+  else                             (1 - stats::pnorm(t))
 }
 
 build_table4 <- function(){
@@ -381,7 +398,27 @@ build_table4 <- function(){
 }
 TABLE4 <- build_table4()
 
-write_table4_tex <- function(TABLE4){
+round_df_to_text <- function(x, digits = 2, skip = character()){
+  df <- as.data.frame(x)
+  for (nm in names(df)) {
+    if (is.numeric(df[[nm]]) && !(nm %in% skip)) {
+      df[[nm]] <- formatC(round(df[[nm]], digits), digits = digits, format = "f")
+    }
+  }
+  df
+}
+
+write_txt <- function(x, path, include_rownames = TRUE){
+  if (isTRUE(include_rownames)) {
+    write.table(x, file = path, sep = "\t", quote = FALSE,
+                col.names = NA, row.names = TRUE)
+  } else {
+    write.table(x, file = path, sep = "\t", quote = FALSE,
+                col.names = TRUE, row.names = FALSE)
+  }
+}
+
+write_table4_tex_and_txt <- function(TABLE4){
   if (is.null(TABLE4) || nrow(TABLE4) == 0) return(invisible())
   rows <- c(paste0("h",1:12), paste0("acc",acc_horizons), "MH-uSPA", "MH-aSPA")
   cols <- unique(TABLE4$model)
@@ -397,6 +434,10 @@ write_table4_tex <- function(TABLE4){
   print(xtable(X_sq, align = c("l", rep("r", ncol(X_sq)))),
         file = file.path(out_dir, "Table4_GW_squared.tex"),
         include.rownames = TRUE, sanitize.text.function = identity)
+  # TXT (2 decimals)
+  X_sq_txt <- round_df_to_text(M_sq, digits = 2)
+  write_txt(cbind(Horizon = rownames(X_sq_txt), X_sq_txt),
+            file.path(out_dir, "Table4_GW_squared.txt"), include_rownames = FALSE)
   
   M_ab <- matrix(NA_real_, nrow = length(rows), ncol = length(cols),
                  dimnames = list(rows, cols))
@@ -409,8 +450,15 @@ write_table4_tex <- function(TABLE4){
   print(xtable(X_ab, align = c("l", rep("r", ncol(X_ab)))),
         file = file.path(out_dir, "Table4_GW_absolute.tex"),
         include.rownames = TRUE, sanitize.text.function = identity)
+  # TXT (2 decimals; keep blanks for NA)
+  X_ab_txt <- as.data.frame(M_ab)
+  X_ab_txt[] <- lapply(X_ab_txt, function(col) {
+    ifelse(is.na(col), "", formatC(round(col, 2), digits = 2, format = "f"))
+  })
+  write_txt(cbind(Horizon = rownames(M_ab), X_ab_txt),
+            file.path(out_dir, "Table4_GW_absolute.txt"), include_rownames = FALSE)
 }
-write_table4_tex(TABLE4)
+write_table4_tex_and_txt(TABLE4)
 
 # ----------------------------- MCS per horizon (for Table 5) --------------------
 loss_matrix_at_h <- function(LS_or_LA, h, min_T = 10, eps_var = 1e-12){
@@ -617,10 +665,19 @@ make_table2 <- function(){
   }
   X <- T2
   for (block in seq(1, ncol(X), by = 3)) X <- boldfmt(X, block:(block+2))
-  
+
   print(xtable(X, align = c("l", rep("r", ncol(X)))),
         file = file.path(out_dir, "Table2_ratios_vs_RW.tex"),
         include.rownames = TRUE, sanitize.text.function = identity)
+
+  # TXT (2 decimals, numeric only)
+  T2_txt <- as.data.frame(T2)
+  for (nm in names(T2_txt)) {
+    T2_txt[[nm]] <- as.numeric(T2_txt[[nm]])
+  }
+  T2_txt <- round_df_to_text(T2_txt, digits = 2)
+  T2_txt <- cbind(Horizon = rownames(T2_txt), T2_txt)
+  write_txt(T2_txt, file.path(out_dir, "Table2_ratios_vs_RW.txt"), include_rownames = FALSE)
 }
 make_table2()
 
@@ -659,10 +716,18 @@ make_table5 <- function(){
   
   mincount <- paste0(rowSums(mcs_sq_mat, na.rm = TRUE)," | ", rowSums(mcs_ab_mat, na.rm = TRUE))
   T5 <- cbind(cells, `MCS count (sq|ab)` = mincount)
-  
+
   print(xtable(T5, align = c("l", rep("r", ncol(T5)))),
         file = file.path(out_dir, "Table5_grid_MCS_shaded.tex"),
         include.rownames = TRUE, sanitize.text.function = identity)
+
+  # TXT (2 decimals): separate clean numeric dumps for RMSE and MAE ratios
+  rm_txt <- round_df_to_text(as.data.frame(rm), digits = 2)
+  rm_txt <- cbind(Model = rownames(rm_txt), rm_txt)
+  write_txt(rm_txt, file.path(out_dir, "Table5_rmse_ratios.txt"), include_rownames = FALSE)
+  ma_txt <- round_df_to_text(as.data.frame(ma), digits = 2)
+  ma_txt <- cbind(Model = rownames(ma_txt), ma_txt)
+  write_txt(ma_txt, file.path(out_dir, "Table5_mae_ratios.txt"), include_rownames = FALSE)
 }
 make_table5()
 
@@ -768,6 +833,10 @@ make_table1 <- function(){
   print(xtable(X, align = c("l", rep("r", ncol(X)))),
         file = file.path(out_dir, "Table1_overview.tex"),
         include.rownames = FALSE, sanitize.text.function = identity)
+
+  # TXT (2 decimals)
+  T1_txt <- round_df_to_text(T1f, digits = 2, skip = c("Model","Best RMSE","Best MAE","Best MAD"))
+  write_txt(T1_txt, file.path(out_dir, "Table1_overview.txt"), include_rownames = FALSE)
 }
 make_table1()
 
