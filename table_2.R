@@ -167,6 +167,16 @@ stopifnot(!is.null(LOSS_S[[rw_model]]), !is.null(LOSS_A[[rw_model]]))
 nprev <- nrow(LOSS_S[[rw_model]])
 horizons_monthly <- paste0("h", 1:12)
 acc_horizons     <- c(3,6,12)  # accumulated targets
+acc_labels <- vapply(acc_horizons, function(k) {
+  acc_col <- paste0("acc", k)
+  has_acc <- any(vapply(models, function(m) {
+    acc_col %in% colnames(LOSS_S[[m]]) || acc_col %in% colnames(LOSS_A[[m]])
+  }, logical(1)))
+  if (has_acc) acc_col else paste0("h", k, " (no acc)")
+}, character(1))
+if (any(!startsWith(acc_labels, "acc"))) {
+  message("Accumulated horizons missing in some models; labeling fallback rows as 'h{3,6,12} (no acc)'.")
+}
 
 # -------------------------- METRICS & RATIOS (for Tables 1,2,5) ------------------
 take_monthly <- function(M) {
@@ -211,9 +221,9 @@ acc_loss_vec <- function(LS_or_LA_m, k){
 
 ACC_METS <- setNames(lapply(models, function(m){
   list(
-    rmse = vapply(acc_horizons, function(k) sqrt(mean(acc_loss_vec(LOSS_S[[m]], k), na.rm = TRUE)), 0.0),
-    mae  = vapply(acc_horizons, function(k) mean(acc_loss_vec(LOSS_A[[m]], k), na.rm = TRUE), 0.0),
-    mad  = vapply(acc_horizons, function(k) median(acc_loss_vec(LOSS_A[[m]], k), na.rm = TRUE), 0.0)
+    rmse = setNames(vapply(acc_horizons, function(k) sqrt(mean(acc_loss_vec(LOSS_S[[m]], k), na.rm = TRUE)), 0.0), acc_labels),
+    mae  = setNames(vapply(acc_horizons, function(k) mean(acc_loss_vec(LOSS_A[[m]], k), na.rm = TRUE), 0.0), acc_labels),
+    mad  = setNames(vapply(acc_horizons, function(k) median(acc_loss_vec(LOSS_A[[m]], k), na.rm = TRUE), 0.0), acc_labels)
   )
 }), models)
 
@@ -257,7 +267,7 @@ spa_pvalue_one_h <- function(loss_mat, b, B = 3000, geom_p = 1/10){
     idx <- gen_idx(Tn, geom_p)
     Db  <- D[idx, , drop = FALSE]
     mu_b <- colMeans(Db)
-    mu_b_plus <- pmax(mu_hat, 0)
+    mu_b_plus <- pmax(mu_b, 0)
     sd_b <- apply(Db, 2, sd)
     sd_b[!is.finite(sd_b) | sd_b == 0] <- Inf
     t_b  <- sqrt(Tn) * (mu_b - mu_b_plus) / sd_b
@@ -358,7 +368,7 @@ build_table4 <- function(){
     }
     tibble(
       model = bm,
-      horizon = c(paste0("h",1:12), paste0("acc",acc_horizons), "MH-uSPA", "MH-aSPA"),
+      horizon = c(paste0("h",1:12), acc_labels, "MH-uSPA", "MH-aSPA"),
       squared = c(p_sq, p_sq_acc, mh_u, mh_a),
       absolute= c(p_ab, p_ab_acc, NA_real_, NA_real_)
     )
@@ -390,7 +400,7 @@ write_txt <- function(x, path, include_rownames = TRUE){
 # ---------------------------- Write Table 4 (LaTeX + TXT) -----------------------
 write_table4_tex_and_txt <- function(TABLE4){
   if (is.null(TABLE4) || nrow(TABLE4) == 0) return(invisible())
-  rows <- c(paste0("h",1:12), paste0("acc",acc_horizons), "MH-uSPA", "MH-aSPA")
+  rows <- c(paste0("h",1:12), acc_labels, "MH-uSPA", "MH-aSPA")
   cols <- unique(TABLE4$model)
   
   M_sq <- matrix(NA_real_, nrow = length(rows), ncol = length(cols),
@@ -497,7 +507,7 @@ mcs_membership <- function(loss_mat_full, type = c("sq","ab")){
       suppressWarnings(
         capture.output({
           MCS::MCSprocedure(Loss = as.data.frame(M, check.names = FALSE),
-                            alpha = 0.5, B = 7500, statistic = "Tmax", cl = NULL)
+                            alpha = 0.10, B = 7500, statistic = "Tmax", cl = NULL)
         }, file = NULL)
       )
     }, silent = TRUE)
@@ -542,10 +552,10 @@ make_table2 <- function(){
     rownames(mat) <- paste0("h",1:12)
     acc <- sapply(models, function(m) {
       v <- ACC_RATIOS[[m]][[which]]       # length 3 numeric
-      names(v) <- paste0("acc", acc_horizons)
-      v[paste0("acc", acc_horizons)]
+      names(v) <- acc_labels
+      v[acc_labels]
     })
-    rownames(acc) <- paste0("acc", acc_horizons)
+    rownames(acc) <- acc_labels
     rbind(mat, acc)
   }
   blk_rmse <- make_block("rmse"); blk_mae <- make_block("mae"); blk_mad <- make_block("mad")
@@ -559,23 +569,27 @@ make_table2 <- function(){
     coln <- c(coln, paste0(m," RMSE"), paste0(m," MAE"), paste0(m," MAD"))
     j <- j + 3
   }
-  T2 <- as.data.frame(T2); rownames(T2) <- c(paste0("h",1:12), paste0("acc",acc_horizons)); colnames(T2) <- coln
-  
-  boldfmt <- function(x, cols_idx){
-    mins <- apply(x[, cols_idx, drop=FALSE], 1, min, na.rm = TRUE)
-    for (r in seq_len(nrow(x))) {
-      for (c in cols_idx) {
-        if (!is.finite(x[r,c])) next
-        if (abs(x[r,c] - mins[r]) < 1e-12)
-          x[r,c] <- sprintf("\\textbf{%.3f}", x[r,c])
-        else
-          x[r,c] <- sprintf("%.3f", x[r,c])
+  T2 <- as.data.frame(T2); rownames(T2) <- c(paste0("h",1:12), acc_labels); colnames(T2) <- coln
+
+  bold_winners <- function(X, metric_idx){
+    cols <- seq(metric_idx, ncol(X), by = 3)
+    mins <- apply(X[, cols, drop = FALSE], 1, min, na.rm = TRUE)
+    for (r in seq_len(nrow(X))) {
+      for (c in cols) {
+        if (!is.finite(X[r, c])) { X[r, c] <- ""; next }
+        if (is.finite(mins[r]) && abs(X[r, c] - mins[r]) < 1e-12) {
+          X[r, c] <- sprintf("\\textbf{%.3f}", X[r, c])
+        } else {
+          X[r, c] <- sprintf("%.3f", X[r, c])
+        }
       }
     }
-    x
+    X
   }
   X <- T2
-  for (block in seq(1, ncol(X), by = 3)) X <- boldfmt(X, block:(block+2))
+  X <- bold_winners(X, 1)
+  X <- bold_winners(X, 2)
+  X <- bold_winners(X, 3)
   
   print(xtable(X, align = c("l", rep("r", ncol(X)))),
         file = file.path(out_dir, "Table2_ratios_vs_RW.tex"),
@@ -600,7 +614,7 @@ make_table5 <- function(){
   ma <- sapply(models, function(m) c(
     RATIOS[[m]]$mae [paste0("h",1:12)],
     ACC_RATIOS[[m]]$mae )) |> t()
-  colnames(rm) <- colnames(ma) <- c(paste0("h",1:12), paste0("acc",acc_horizons))
+  colnames(rm) <- colnames(ma) <- c(paste0("h",1:12), acc_labels)
   rownames(rm) <- rownames(ma) <- models
   
   bold_rm <- apply(rm, 2, function(col){
@@ -651,7 +665,7 @@ make_table1 <- function(){
     }) |> t()
     colnames(mat_h) <- paste0("h",1:12)
     mat_acc <- sapply(models, function(m) ACC_RATIOS[[m]][[which]]) |> t()
-    colnames(mat_acc) <- paste0("acc",acc_horizons)
+    colnames(mat_acc) <- acc_labels
     M <- cbind(mat_h, mat_acc)  # n_models x 15
     
     # Count how many horizons each model achieves the row-min
@@ -740,3 +754,172 @@ make_table1 <- function(){
 make_table1()
 
 message("All tables written to: ", normalizePath(out_dir, winslash = "/"))
+# -------------------------- Single-horizon MCS helper ---------------------------
+# modelconf_single_mcs() replicates the iterative elimination logic of the Model
+# Confidence Set procedure for a single loss matrix.  The implementation keeps
+# the bootstrap logic deliberately simple (resampling rows with replacement) to
+# avoid any dependency on unexported MCS internals while preserving the
+# elimination order used by the reference `modelconf` utilities.  The main
+# difference compared with a naïve implementation is that the model removed at
+# each step is determined from the statistics returned by the testing stage
+# (d-bar for "Tmax" or the range metric for "TR") rather than the raw column
+# means of the filtered loss matrix.
+modelconf_single_mcs <- function(loss_matrix,
+                                 alpha = 0.25,
+                                 B = 2000,
+                                 statistic = c("Tmax", "TR"),
+                                 seed = NULL,
+                                 quiet = TRUE) {
+  statistic <- match.arg(statistic)
+
+  loss_matrix <- as.matrix(loss_matrix)
+  if (!nrow(loss_matrix) || !ncol(loss_matrix)) {
+    return(list(models = colnames(loss_matrix),
+                removal = tibble::tibble(step = integer(), model = character(), p_value = numeric()),
+                statistic = statistic))
+  }
+
+  # Drop rows where every model is NA – they carry no information for the MCS
+  # comparisons.
+  row_keep <- rowSums(is.finite(loss_matrix)) > 0
+  loss_matrix <- loss_matrix[row_keep, , drop = FALSE]
+
+  if (!nrow(loss_matrix) || !ncol(loss_matrix)) {
+    return(list(models = colnames(loss_matrix),
+                removal = tibble::tibble(step = integer(), model = character(), p_value = numeric()),
+                statistic = statistic))
+  }
+
+  model_names <- colnames(loss_matrix)
+  if (is.null(model_names)) {
+    model_names <- paste0("model", seq_len(ncol(loss_matrix)))
+    colnames(loss_matrix) <- model_names
+  }
+
+  # Ensure we restore the RNG state if a seed is provided.
+  if (!is.null(seed)) {
+    had_seed <- exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)
+    if (had_seed) old_seed <- get(".Random.seed", envir = .GlobalEnv)
+    set.seed(seed)
+    on.exit({
+      if (isTRUE(had_seed)) {
+        assign(".Random.seed", old_seed, envir = .GlobalEnv)
+      } else if (exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)) {
+        rm(".Random.seed", envir = .GlobalEnv)
+      }
+    }, add = TRUE)
+  }
+
+  calc_statistics <- function(mat) {
+    nm <- colnames(mat)
+    m  <- ncol(mat)
+    if (m <= 1L) {
+      return(list(dbar = setNames(rep(0, m), nm), tr = setNames(rep(0, m), nm),
+                  dbar_matrix = matrix(0, nrow = m, ncol = m, dimnames = list(nm, nm))))
+    }
+
+    dbar_matrix <- matrix(NA_real_, nrow = m, ncol = m, dimnames = list(nm, nm))
+    for (i in seq_len(m)) {
+      for (j in seq_len(m)) {
+        if (i == j) next
+        dif <- mat[, i] - mat[, j]
+        if (!any(is.finite(dif))) next
+        dbar_matrix[i, j] <- mean(dif, na.rm = TRUE)
+      }
+    }
+
+    dbar_vals <- rowMeans(dbar_matrix, na.rm = TRUE)
+    dbar_vals[!is.finite(dbar_vals)] <- NA_real_
+    tr_vals <- apply(abs(dbar_matrix), 1, function(row) {
+      if (all(!is.finite(row))) return(NA_real_)
+      max(row, na.rm = TRUE)
+    })
+    tr_vals[!is.finite(tr_vals)] <- NA_real_
+
+    list(dbar = dbar_vals, tr = tr_vals, dbar_matrix = dbar_matrix)
+  }
+
+  compute_test_stat <- function(stat_obj, stat_type) {
+    if (stat_type == "TR") {
+      dm <- stat_obj$dbar_matrix
+      if (length(dm) == 0L) return(NA_real_)
+      upper <- dm[upper.tri(dm, diag = FALSE)]
+      upper <- abs(upper[is.finite(upper)])
+      if (!length(upper)) return(NA_real_)
+      max(upper)
+    } else {
+      vals <- stat_obj$dbar
+      vals <- vals[is.finite(vals)]
+      if (!length(vals)) return(NA_real_)
+      max(vals)
+    }
+  }
+
+  bootstrap_stat <- function(mat, stat_type, B) {
+    n <- nrow(mat)
+    if (B <= 0 || n <= 1) return(numeric(0))
+    res <- numeric(B)
+    for (b in seq_len(B)) {
+      idx <- sample.int(n, n, replace = TRUE)
+      boot <- mat[idx, , drop = FALSE]
+      stat_obj <- calc_statistics(boot)
+      res[b] <- compute_test_stat(stat_obj, stat_type)
+    }
+    res[is.na(res)] <- NA_real_
+    res
+  }
+
+  survivors <- model_names
+  removal_log <- tibble::tibble(step = integer(), model = character(), p_value = numeric())
+  current <- loss_matrix
+  step <- 0L
+
+  repeat {
+    # Remove models that are entirely NA in the current subset.
+    valid_cols <- colSums(is.finite(current)) > 0
+    current <- current[, valid_cols, drop = FALSE]
+    survivors <- survivors[survivors %in% colnames(current)]
+
+    if (ncol(current) <= 1L) break
+
+    stat_obj <- calc_statistics(current)
+    obs_stat <- compute_test_stat(stat_obj, statistic)
+    if (!is.finite(obs_stat)) break
+
+    boot_stats <- bootstrap_stat(current, statistic, B)
+    if (length(boot_stats)) {
+      p_val <- mean(boot_stats >= obs_stat, na.rm = TRUE)
+      if (is.nan(p_val)) p_val <- NA_real_
+    } else {
+      p_val <- NA_real_
+    }
+
+    if (is.na(p_val) || (!is.na(alpha) && p_val > alpha)) break
+
+    elim_metric <- if (statistic == "TR") stat_obj$tr else stat_obj$dbar
+    if (is.null(elim_metric) || !length(elim_metric)) break
+    elim_metric <- elim_metric[colnames(current)]
+    if (all(is.na(elim_metric))) break
+
+    finite_idx <- which(is.finite(elim_metric))
+    if (!length(finite_idx)) break
+
+    drop_idx <- finite_idx[which.max(elim_metric[finite_idx])]
+    drop_model <- names(elim_metric)[drop_idx]
+
+    step <- step + 1L
+    if (!quiet) {
+      msg <- sprintf("Eliminating %s (step %d) with p-value %.4f", drop_model, step,
+                     ifelse(is.na(p_val), NaN, p_val))
+      message(msg)
+    }
+    removal_log <- dplyr::bind_rows(removal_log,
+      tibble::tibble(step = step, model = drop_model, p_value = p_val))
+
+    survivors <- setdiff(survivors, drop_model)
+    current <- current[, setdiff(colnames(current), drop_model), drop = FALSE]
+  }
+
+  list(models = survivors, removal = removal_log, statistic = statistic)
+}
+
