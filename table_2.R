@@ -206,11 +206,107 @@ normalize_pred_matrix <- function(mat, reference_cols){
   mat
 }
 
+compute_ensembles <- function(actual_ref, ref_cols, base_models, pred_list, nprev){
+  if (is.null(actual_ref) || is.null(ref_cols)) return(list())
+  row_stat <- function(mat, fn) apply(mat, 1, fn)
+  mean_fun <- function(preds){
+    res <- rowMeans(preds, na.rm = TRUE)
+    res[is.nan(res)] <- NA_real_
+    res
+  }
+  median_fun <- function(preds){
+    row_stat(preds, function(x){
+      x <- x[is.finite(x)]
+      if (!length(x)) return(NA_real_)
+      stats::median(x)
+    })
+  }
+  trim_fun <- function(preds){
+    row_stat(preds, function(x){
+      x <- x[is.finite(x)]
+      if (!length(x)) return(NA_real_)
+      mean(x, trim = 0.1)
+    })
+  }
+  build_ensemble <- function(fun){
+    pred_mat <- matrix(NA_real_, nrow = nprev, ncol = length(ref_cols),
+                       dimnames = list(NULL, ref_cols))
+    loss_sq  <- pred_mat
+    loss_ab  <- pred_mat
+    for (col in ref_cols) {
+      preds <- sapply(base_models, function(m) {
+        mat <- pred_list[[m]]
+        if (is.null(mat)) return(rep(NA_real_, nprev))
+        if (!(col %in% colnames(mat))) return(rep(NA_real_, nprev))
+        vec <- mat[, col]
+        if (length(vec) < nprev) vec <- c(vec, rep(NA_real_, nprev - length(vec)))
+        else if (length(vec) > nprev) vec <- vec[seq_len(nprev)]
+        vec
+      })
+      if (!is.matrix(preds)) preds <- matrix(preds, ncol = 1)
+      actual <- actual_ref[, col]
+      if (all(!is.finite(preds)) || all(!is.finite(actual))) {
+        next
+      }
+      pred_col <- fun(preds)
+      if (length(pred_col) != nprev) pred_col <- rep(NA_real_, nprev)
+      err <- actual - pred_col
+      pred_mat[, col] <- pred_col
+      loss_sq[, col]  <- err^2
+      loss_ab[, col]  <- abs(err)
+    }
+    list(pred = pred_mat, loss_sq = loss_sq, loss_abs = loss_ab)
+  }
+  list(
+    `mean` = build_ensemble(mean_fun),
+    `median` = build_ensemble(median_fun),
+    `trimmed mean` = build_ensemble(trim_fun)
+  )
+}
+
 extract_reference_actual <- function(){
   for (nm in models) {
     mat <- Y_REAL[[nm]]
     if (is.matrix(mat) && any(is.finite(mat))) {
       return(list(actual = mat, source = nm))
+    }
+  }
+  NULL
+}
+
+load_actual_from_dados <- function(series, nprev, ref_cols){
+  if (is.null(ref_cols)) return(NULL)
+  candidate_paths <- c("dados.rda","dados.RData","dados.Rdata","dados.rds","dados.RDS")
+  for (path in candidate_paths) {
+    if (!file.exists(path)) next
+    env <- new.env(parent = emptyenv())
+    loaded_objs <- try(load(path, envir = env), silent = TRUE)
+    if (inherits(loaded_objs, "try-error")) next
+    obj_names <- as.character(loaded_objs)
+    for (nm in obj_names) {
+      obj <- get(nm, envir = env)
+      if (!(is.matrix(obj) || is.data.frame(obj))) next
+      if (!(series %in% colnames(obj))) next
+      vec <- as.numeric(obj[, series])
+      if (!length(vec)) next
+      if (length(vec) < nprev) next
+      actual_vec <- tail(vec, nprev)
+      mat <- matrix(NA_real_, nrow = nprev, ncol = length(ref_cols),
+                    dimnames = list(NULL, ref_cols))
+      month_cols <- intersect(paste0("h", seq_len(12)), ref_cols)
+      for (col in month_cols) mat[, col] <- actual_vec
+      acc_cols <- intersect(paste0("acc", acc_horizons), ref_cols)
+      if (length(acc_cols)) {
+        for (col in acc_cols) {
+          k <- as.integer(sub("acc", "", col))
+          if (!is.na(k) && k > 0 && length(vec) >= (nprev + k - 1)) {
+            acc_vals <- zoo::rollapply(vec, width = k, align = "right",
+                                      FUN = function(x) mean(x, na.rm = TRUE), fill = NA)
+            mat[, col] <- tail(acc_vals, nprev)
+          }
+        }
+      }
+      return(list(actual = mat, source = nm, path = path))
     }
   }
   NULL
@@ -238,68 +334,7 @@ if (!is.null(ref_info)) {
     PRED[[nm]] <- normalize_pred_matrix(PRED[[nm]], ref_cols)
   }
 
-  build_ensemble <- function(fun){
-    if (is.null(ref_cols)) return(NULL)
-    pred_mat <- matrix(NA_real_, nrow = nprev, ncol = length(ref_cols),
-                       dimnames = list(NULL, ref_cols))
-    loss_sq  <- pred_mat
-    loss_ab  <- pred_mat
-    for (col in ref_cols) {
-      preds <- sapply(base_models, function(m) {
-        mat <- PRED[[m]]
-        if (is.null(mat)) return(rep(NA_real_, nprev))
-        if (!(col %in% colnames(mat))) return(rep(NA_real_, nprev))
-        vec <- mat[, col]
-        if (length(vec) < nprev) vec <- c(vec, rep(NA_real_, nprev - length(vec)))
-        else if (length(vec) > nprev) vec <- vec[seq_len(nprev)]
-        vec
-      })
-      if (!is.matrix(preds)) preds <- matrix(preds, ncol = 1)
-      actual <- actual_ref[, col]
-      if (all(!is.finite(preds)) || all(!is.finite(actual))) {
-        next
-      }
-      pred_col <- fun(preds)
-      if (length(pred_col) != nprev) {
-        pred_col <- rep(NA_real_, nprev)
-      }
-      err <- actual - pred_col
-      pred_mat[, col] <- pred_col
-      loss_sq[, col]  <- err^2
-      loss_ab[, col]  <- abs(err)
-    }
-    list(pred = pred_mat, loss_sq = loss_sq, loss_abs = loss_ab)
-  }
-
-  row_stat <- function(mat, fn){
-    apply(mat, 1, fn)
-  }
-
-  mean_fun <- function(preds){
-    res <- rowMeans(preds, na.rm = TRUE)
-    res[is.nan(res)] <- NA_real_
-    res
-  }
-  median_fun <- function(preds){
-    row_stat(preds, function(x){
-      x <- x[is.finite(x)]
-      if (!length(x)) return(NA_real_)
-      stats::median(x)
-    })
-  }
-  trim_fun <- function(preds){
-    row_stat(preds, function(x){
-      x <- x[is.finite(x)]
-      if (!length(x)) return(NA_real_)
-      mean(x, trim = 0.1)
-    })
-  }
-
-  ensembles <- list(
-    `mean` = build_ensemble(mean_fun),
-    `median` = build_ensemble(median_fun),
-    `trimmed mean` = build_ensemble(trim_fun)
-  )
+  ensembles <- compute_ensembles(actual_ref, ref_cols, base_models, PRED, nprev)
 
   added_ensembles <- character(0)
   for (nm in names(ensembles)) {
@@ -313,10 +348,50 @@ if (!is.null(ref_info)) {
     added_ensembles <- c(added_ensembles, nm)
   }
 
-  if (length(added_ensembles)) models <- c(models, added_ensembles)
+  if (length(added_ensembles)) {
+    models <- c(models, added_ensembles)
+    message("Added ensemble forecasts: ", paste(added_ensembles, collapse = ", "))
+  }
 } else {
-  warning("No actual series found among models; ensemble rows will be skipped.")
+  dados_info <- load_actual_from_dados(series, nprev, colnames(LOSS_S[[rw_model]]))
+  if (!is.null(dados_info)) {
+    actual_ref <- dados_info$actual
+    ref_cols <- colnames(actual_ref)
+    base_models <- models
+    for (nm in base_models) {
+      PRED[[nm]] <- normalize_pred_matrix(PRED[[nm]], ref_cols)
+    }
+    ensembles <- compute_ensembles(actual_ref, ref_cols, base_models, PRED, nprev)
+    added_ensembles <- character(0)
+    for (nm in names(ensembles)) {
+      ens <- ensembles[[nm]]
+      if (is.null(ens)) next
+      if (all(is.na(ens$loss_sq)) && all(is.na(ens$loss_abs))) next
+      if (nm %in% models) next
+      LOSS_S[[nm]] <- ens$loss_sq
+      LOSS_A[[nm]] <- ens$loss_abs
+      PRED[[nm]]   <- ens$pred
+      added_ensembles <- c(added_ensembles, nm)
+    }
+    if (length(added_ensembles)) {
+      models <- c(models, added_ensembles)
+      message("Actuals sourced from ", dados_info$path, " (object '", dados_info$source,
+              "'); added ensembles: ", paste(added_ensembles, collapse = ", "))
+    } else {
+      warning("Actual series loaded from ", dados_info$path, " but ensembles could not be formed (missing predictions).")
+    }
+  } else {
+    warning("No actual series found among models or dados.* files; ensemble rows will be skipped.")
+  }
 }
+
+models <- unique(models)
+
+ensemble_models <- intersect(c("mean","median","trimmed mean"), models)
+model_labels <- setNames(ifelse(models %in% ensemble_models,
+                                paste0(models, " (ens)"),
+                                models),
+                         models)
 
 # -------------------------- METRICS & RATIOS (for Tables 1,2,5) ------------------
 take_monthly <- function(M) {
@@ -551,11 +626,13 @@ write_table4_tex_and_txt <- function(TABLE4){
     M_sq[intersect(rows, names(vals)), bm] <- vals[intersect(rows, names(vals))]
   }
   X_sq <- as.data.frame(apply(M_sq, 2, function(c) sprintf("%.3f", c)))
+  colnames(X_sq) <- model_labels[colnames(X_sq)]
   print(xtable(X_sq, align = c("l", rep("r", ncol(X_sq)))),
         file = file.path(out_dir, "Table4_GW_squared.tex"),
         include.rownames = TRUE, sanitize.text.function = identity)
   # TXT (2 decimals)
   X_sq_txt <- round_df_to_text(M_sq, digits = 2)
+  colnames(X_sq_txt) <- model_labels[colnames(X_sq_txt)]
   write_txt(cbind(Horizon = rownames(X_sq_txt), X_sq_txt),
             file.path(out_dir, "Table4_GW_squared.txt"), include_rownames = FALSE)
   
@@ -567,6 +644,7 @@ write_table4_tex_and_txt <- function(TABLE4){
     M_ab[intersect(rows, names(vals)), bm] <- vals[intersect(rows, names(vals))]
   }
   X_ab <- as.data.frame(apply(M_ab, 2, function(c) ifelse(is.na(c), "", sprintf("%.3f", c))))
+  colnames(X_ab) <- model_labels[colnames(X_ab)]
   print(xtable(X_ab, align = c("l", rep("r", ncol(X_ab)))),
         file = file.path(out_dir, "Table4_GW_absolute.tex"),
         include.rownames = TRUE, sanitize.text.function = identity)
@@ -575,6 +653,7 @@ write_table4_tex_and_txt <- function(TABLE4){
   X_ab_txt[] <- lapply(X_ab_txt, function(col) {
     ifelse(is.na(col), "", formatC(round(col, 2), digits = 2, format = "f"))
   })
+  colnames(X_ab_txt) <- model_labels[colnames(X_ab_txt)]
   write_txt(cbind(Horizon = rownames(M_ab), X_ab_txt),
             file.path(out_dir, "Table4_GW_absolute.txt"), include_rownames = FALSE)
 }
@@ -811,10 +890,11 @@ make_table2 <- function(){
   T2 <- array(NA_real_, dim = c(nrow(blk_rmse), 3*length(models)))
   coln <- c(); j <- 1
   for (m in models) {
+    label <- model_labels[[m]]
     T2[, j]   <- blk_rmse[, m]
     T2[, j+1] <- blk_mae[,  m]
     T2[, j+2] <- blk_mad[,  m]
-    coln <- c(coln, paste0(m," RMSE"), paste0(m," MAE"), paste0(m," MAD"))
+    coln <- c(coln, paste0(label," RMSE"), paste0(label," MAE"), paste0(label," MAD"))
     j <- j + 3
   }
   T2 <- as.data.frame(T2); rownames(T2) <- c(paste0("h",1:12), paste0("acc",acc_horizons)); colnames(T2) <- coln
@@ -867,7 +947,7 @@ make_table5 <- function(){
   })
   par_ma <- apply(ma, 2, function(col) vapply(col, function(x) sprintf("(%.3f)", x), ""))
   cells <- matrix(paste0(bold_rm, "", par_ma), nrow = nrow(rm), dimnames = dimnames(rm))
-  
+
   mcs_sq_mat <- do.call(cbind, MCS_SQ); rownames(mcs_sq_mat) <- models
   mcs_ab_mat <- do.call(cbind, MCS_AB); rownames(mcs_ab_mat) <- models
   
@@ -884,17 +964,22 @@ make_table5 <- function(){
   }
   
   mincount <- paste0(rowSums(mcs_sq_mat, na.rm = TRUE)," | ", rowSums(mcs_ab_mat, na.rm = TRUE))
+  orig_rows <- rownames(cells)
+  names(mincount) <- model_labels[orig_rows]
+  rownames(cells) <- model_labels[orig_rows]
   T5 <- cbind(cells, `MCS count (sq|ab)` = mincount)
-  
+
   print(xtable(T5, align = c("l", rep("r", ncol(T5)))),
         file = file.path(out_dir, "Table5_grid_MCS_shaded.tex"),
         include.rownames = TRUE, sanitize.text.function = identity)
-  
+
   # TXT (2 decimals): separate clean numeric dumps for RMSE and MAE ratios
   rm_txt <- round_df_to_text(as.data.frame(rm), digits = 2)
+  rownames(rm_txt) <- model_labels[rownames(rm_txt)]
   rm_txt <- cbind(Model = rownames(rm_txt), rm_txt)
   write_txt(rm_txt, file.path(out_dir, "Table5_rmse_ratios.txt"), include_rownames = FALSE)
   ma_txt <- round_df_to_text(as.data.frame(ma), digits = 2)
+  rownames(ma_txt) <- model_labels[rownames(ma_txt)]
   ma_txt <- cbind(Model = rownames(ma_txt), ma_txt)
   write_txt(ma_txt, file.path(out_dir, "Table5_mae_ratios.txt"), include_rownames = FALSE)
 }
@@ -964,7 +1049,7 @@ make_table1 <- function(){
   
   T1f <- T1 |>
     dplyr::transmute(
-      Model = model,
+      Model = model_labels[model],
       `Avg RMSE`=avg_rmse, `Avg MAE`=avg_mae, `Avg MAD`=avg_mad,
       `Max RMSE`=max_rmse, `Max MAE`=max_mae, `Max MAD`=max_mad,
       `Min RMSE`=min_rmse, `Min MAE`=min_mae, `Min MAD`=min_mad,
