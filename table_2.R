@@ -740,3 +740,172 @@ make_table1 <- function(){
 make_table1()
 
 message("All tables written to: ", normalizePath(out_dir, winslash = "/"))
+# -------------------------- Single-horizon MCS helper ---------------------------
+# modelconf_single_mcs() replicates the iterative elimination logic of the Model
+# Confidence Set procedure for a single loss matrix.  The implementation keeps
+# the bootstrap logic deliberately simple (resampling rows with replacement) to
+# avoid any dependency on unexported MCS internals while preserving the
+# elimination order used by the reference `modelconf` utilities.  The main
+# difference compared with a naïve implementation is that the model removed at
+# each step is determined from the statistics returned by the testing stage
+# (d-bar for "Tmax" or the range metric for "TR") rather than the raw column
+# means of the filtered loss matrix.
+modelconf_single_mcs <- function(loss_matrix,
+                                 alpha = 0.25,
+                                 B = 2000,
+                                 statistic = c("Tmax", "TR"),
+                                 seed = NULL,
+                                 quiet = TRUE) {
+  statistic <- match.arg(statistic)
+
+  loss_matrix <- as.matrix(loss_matrix)
+  if (!nrow(loss_matrix) || !ncol(loss_matrix)) {
+    return(list(models = colnames(loss_matrix),
+                removal = tibble::tibble(step = integer(), model = character(), p_value = numeric()),
+                statistic = statistic))
+  }
+
+  # Drop rows where every model is NA – they carry no information for the MCS
+  # comparisons.
+  row_keep <- rowSums(is.finite(loss_matrix)) > 0
+  loss_matrix <- loss_matrix[row_keep, , drop = FALSE]
+
+  if (!nrow(loss_matrix) || !ncol(loss_matrix)) {
+    return(list(models = colnames(loss_matrix),
+                removal = tibble::tibble(step = integer(), model = character(), p_value = numeric()),
+                statistic = statistic))
+  }
+
+  model_names <- colnames(loss_matrix)
+  if (is.null(model_names)) {
+    model_names <- paste0("model", seq_len(ncol(loss_matrix)))
+    colnames(loss_matrix) <- model_names
+  }
+
+  # Ensure we restore the RNG state if a seed is provided.
+  if (!is.null(seed)) {
+    had_seed <- exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)
+    if (had_seed) old_seed <- get(".Random.seed", envir = .GlobalEnv)
+    set.seed(seed)
+    on.exit({
+      if (isTRUE(had_seed)) {
+        assign(".Random.seed", old_seed, envir = .GlobalEnv)
+      } else if (exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)) {
+        rm(".Random.seed", envir = .GlobalEnv)
+      }
+    }, add = TRUE)
+  }
+
+  calc_statistics <- function(mat) {
+    nm <- colnames(mat)
+    m  <- ncol(mat)
+    if (m <= 1L) {
+      return(list(dbar = setNames(rep(0, m), nm), tr = setNames(rep(0, m), nm),
+                  dbar_matrix = matrix(0, nrow = m, ncol = m, dimnames = list(nm, nm))))
+    }
+
+    dbar_matrix <- matrix(NA_real_, nrow = m, ncol = m, dimnames = list(nm, nm))
+    for (i in seq_len(m)) {
+      for (j in seq_len(m)) {
+        if (i == j) next
+        dif <- mat[, i] - mat[, j]
+        if (!any(is.finite(dif))) next
+        dbar_matrix[i, j] <- mean(dif, na.rm = TRUE)
+      }
+    }
+
+    dbar_vals <- rowMeans(dbar_matrix, na.rm = TRUE)
+    dbar_vals[!is.finite(dbar_vals)] <- NA_real_
+    tr_vals <- apply(abs(dbar_matrix), 1, function(row) {
+      if (all(!is.finite(row))) return(NA_real_)
+      max(row, na.rm = TRUE)
+    })
+    tr_vals[!is.finite(tr_vals)] <- NA_real_
+
+    list(dbar = dbar_vals, tr = tr_vals, dbar_matrix = dbar_matrix)
+  }
+
+  compute_test_stat <- function(stat_obj, stat_type) {
+    if (stat_type == "TR") {
+      dm <- stat_obj$dbar_matrix
+      if (length(dm) == 0L) return(NA_real_)
+      upper <- dm[upper.tri(dm, diag = FALSE)]
+      upper <- abs(upper[is.finite(upper)])
+      if (!length(upper)) return(NA_real_)
+      max(upper)
+    } else {
+      vals <- stat_obj$dbar
+      vals <- vals[is.finite(vals)]
+      if (!length(vals)) return(NA_real_)
+      max(vals)
+    }
+  }
+
+  bootstrap_stat <- function(mat, stat_type, B) {
+    n <- nrow(mat)
+    if (B <= 0 || n <= 1) return(numeric(0))
+    res <- numeric(B)
+    for (b in seq_len(B)) {
+      idx <- sample.int(n, n, replace = TRUE)
+      boot <- mat[idx, , drop = FALSE]
+      stat_obj <- calc_statistics(boot)
+      res[b] <- compute_test_stat(stat_obj, stat_type)
+    }
+    res[is.na(res)] <- NA_real_
+    res
+  }
+
+  survivors <- model_names
+  removal_log <- tibble::tibble(step = integer(), model = character(), p_value = numeric())
+  current <- loss_matrix
+  step <- 0L
+
+  repeat {
+    # Remove models that are entirely NA in the current subset.
+    valid_cols <- colSums(is.finite(current)) > 0
+    current <- current[, valid_cols, drop = FALSE]
+    survivors <- survivors[survivors %in% colnames(current)]
+
+    if (ncol(current) <= 1L) break
+
+    stat_obj <- calc_statistics(current)
+    obs_stat <- compute_test_stat(stat_obj, statistic)
+    if (!is.finite(obs_stat)) break
+
+    boot_stats <- bootstrap_stat(current, statistic, B)
+    if (length(boot_stats)) {
+      p_val <- mean(boot_stats >= obs_stat, na.rm = TRUE)
+      if (is.nan(p_val)) p_val <- NA_real_
+    } else {
+      p_val <- NA_real_
+    }
+
+    if (is.na(p_val) || (!is.na(alpha) && p_val > alpha)) break
+
+    elim_metric <- if (statistic == "TR") stat_obj$tr else stat_obj$dbar
+    if (is.null(elim_metric) || !length(elim_metric)) break
+    elim_metric <- elim_metric[colnames(current)]
+    if (all(is.na(elim_metric))) break
+
+    finite_idx <- which(is.finite(elim_metric))
+    if (!length(finite_idx)) break
+
+    drop_idx <- finite_idx[which.max(elim_metric[finite_idx])]
+    drop_model <- names(elim_metric)[drop_idx]
+
+    step <- step + 1L
+    if (!quiet) {
+      msg <- sprintf("Eliminating %s (step %d) with p-value %.4f", drop_model, step,
+                     ifelse(is.na(p_val), NaN, p_val))
+      message(msg)
+    }
+    removal_log <- dplyr::bind_rows(removal_log,
+      tibble::tibble(step = step, model = drop_model, p_value = p_val))
+
+    survivors <- setdiff(survivors, drop_model)
+    current <- current[, setdiff(colnames(current), drop_model), drop = FALSE]
+  }
+
+  list(models = survivors, removal = removal_log, statistic = statistic)
+}
+
